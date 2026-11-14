@@ -1,0 +1,99 @@
+# StreamForge full local stack.
+#
+#   docker compose -f deployments/docker-compose.yml up -d --build
+#
+#   Grafana     http://localhost:3000   (anonymous admin; dashboard "StreamForge")
+#   Prometheus  http://localhost:9090
+#   Analytics   http://localhost:8080/v1/summary
+#   Ingest API  http://localhost:8081/v1/events
+#   Redpanda    localhost:19092 (Kafka API, from the host)
+#   ClickHouse  http://localhost:8123
+#
+# NOTE: written against Compose v2 and the image tags below. It has not been
+# executed in the environment this repo was authored in — if a tag has moved,
+# bump it; nothing in the Go code depends on a specific version.
+
+x-app: &app
+  build: { context: .., dockerfile: Dockerfile }
+  restart: unless-stopped
+  depends_on:
+    redpanda:   { condition: service_healthy }
+    clickhouse: { condition: service_healthy }
+  environment: &appenv
+    SF_BROKER: redpanda
+    SF_BROKERS: redpanda:9092
+    SF_TOPIC: events
+    SF_PARTITIONS: "6"
+    SF_STORE: clickhouse
+    SF_CLICKHOUSE_URL: http://clickhouse:8123
+    SF_CLICKHOUSE_USER: streamforge
+    SF_CLICKHOUSE_PASSWORD: streamforge
+
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports: ["19092:19092"]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_USER: streamforge
+      CLICKHOUSE_PASSWORD: streamforge
+      CLICKHOUSE_DB: streamforge
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports: ["8123:8123"]
+    ulimits: { nofile: { soft: 262144, hard: 262144 } }
+    volumes: [chdata:/var/lib/clickhouse]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping | grep -q Ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  producer:
+    <<: *app
+    entrypoint: ["/usr/local/bin/producer"]
+    command: ["-rate", "2000", "-serve", ":8081", "-disorder", "0.15", "-dup", "0.02", "-poison", "0.005"]
+    ports: ["8081:8081"]
+
+  processor:            # scale out: docker compose up -d --scale processor=3
+    <<: *app
+    deploy: { replicas: 2 }
+    command: ["-topic", "events", "-group", "streamforge-processors", "-window", "10s", "-max-ooo", "3s", "-lateness", "10s"]
+
+  api:
+    <<: *app
+    entrypoint: ["/usr/local/bin/api"]
+    ports: ["8080:8080"]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes: [./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+volumes:
+  chdata:

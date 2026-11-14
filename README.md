@@ -2,241 +2,148 @@
 
 **Real-Time Distributed Event Streaming & Analytics Engine**
 
-StreamForge is a distributed event streaming and analytics platform designed to ingest, process, and analyze high-volume event streams in real time.
+StreamForge ingests, processes and analyses high-volume event streams in real time.
+Built with **Go**, **Redpanda** and **ClickHouse**, it focuses on the hard parts of
+distributed stream processing: partitioning, event-time windowing, out-of-order
+and late data, backpressure, and fault recovery that never silently loses or
+double-counts data.
 
-Built with Go, Redpanda, and ClickHouse, the system explores the engineering challenges behind distributed event processing, including message partitioning, event-time windowing, out-of-order event handling, backpressure management, and fault recovery.
+> **Author:** Brian Obonyo · Apache-2.0 · design references credited in source headers
+> and `docs/`.
 
-The project aims to provide a scalable and observable event processing pipeline capable of handling simulated IoT telemetry, financial market data, and application clickstream events.
+## See it work in 20 seconds
 
-## Overview
+```bash
+go run ./cmd/demo
+```
 
-Modern distributed applications generate enormous volumes of continuous data. Processing these events reliably requires more than simply moving messages between services.
+The demo runs the whole pipeline in one process, injects out-of-order events,
+duplicates and garbage, **hard-kills a processor mid-stream**, starts a replacement,
+then compares unique events produced against events counted in the store:
 
-StreamForge explores how distributed streaming systems can:
+```
+messages produced:           48397
+  unique valid events:       45047
+  injected duplicates:       2358
+  injected garbage:          992
+events counted in store:     45047
 
-- Ingest high-throughput event streams.
-- Distribute messages across multiple partitions.
-- Process events concurrently using consumer groups.
-- Perform real-time windowed aggregations.
-- Handle late-arriving and out-of-order events.
-- Manage backpressure under sustained workloads.
-- Recover from consumer failures without silently losing data.
-- Persist analytical results for fast querying.
+✓ EXACT: every unique event was counted exactly once — through disorder, duplicates, garbage and a crash.
+```
 
-The objective is to build a practical streaming architecture with measurable performance, predictable failure behaviour, and transparent observability.
+## Status — what is built and what has been verified
+
+| Area | State |
+|---|---|
+| Event model, validation, partitioning (hash / jump / round-robin) | ✅ built, unit-tested |
+| In-memory broker (partitions, consumer groups, rebalance, commits, pause/resume) | ✅ built, tested |
+| Event-time windows (tumbling, sliding), watermarks, allowed lateness | ✅ built, tested |
+| Backpressure (bounded queues, broker pause, token bucket, AIMD) | ✅ built, tested incl. end-to-end |
+| Reliability (dedup, jittered retry, circuit breaker, DLQ, idempotent sink) | ✅ built, tested |
+| Offset management with safe-offset commits | ✅ built, crash-tested |
+| ClickHouse store (HTTP, parameterised) | ✅ built, tested against an **HTTP stub only** |
+| Analytics API, ingestion API, Prometheus metrics | ✅ built, tested |
+| Redpanda adapter (franz-go) | 🟡 **compiles & vets with `-tags redpanda`; never run against a live broker** |
+| Docker Compose, Grafana dashboard, Prometheus config | 🟡 written & syntax-validated; **never started** |
+| k6 load test | 🟡 written; **never run** |
+| OpenTelemetry tracing | ⬜ not started (metrics via Prometheus are done) |
+| Published benchmark vs real Redpanda/ClickHouse | ⬜ pending — see `benchmarks/RESULTS.md` for engine-only numbers |
+
+Everything marked ✅ is covered by `go test -race ./...`; the chaos integration test
+passed 6 consecutive runs under the race detector.
 
 ## Architecture
 
-The planned system follows a distributed ingestion and processing architecture.
-
-```text
-       Event Producers
-              |
-              v
-       Go Ingestion API
-              |
-              v
-     Redpanda Event Broker
-              |
-       Topic Partitions
-              |
-              v
-      Go Stream Processors
-              |
-       +------+------+
-       |             |
-       v             v
-  Aggregation    Event-Time
-   Windows       Processing
-       |             |
-       +------+------+
-              |
-              v
-       ClickHouse
-              |
-              v
-       Analytics API
-              |
-              v
-       Monitoring & Dashboards
+```
+ Event producers / HTTP ──▶ Ingestion (Go) ──▶ Redpanda topic (partitions)
+                                                     │
+                                  consumer group of Go stream processors
+                                                     │
+                       per partition: Queue ▶ validate ▶ dedup ▶ windows+watermark
+                                                     │
+                                  idempotent upsert  ▼
+                                               ClickHouse ──▶ Analytics API ──▶ Grafana
 ```
 
-## Technology Stack
+Full design, concurrency model and delivery guarantees: [`docs/architecture.md`](docs/architecture.md).
+Decisions and trade-offs: [`docs/adr/`](docs/adr/).
 
-| Technology | Purpose |
-|---|---|
-| Go | Event producers and stream processors |
-| Redpanda | Distributed event streaming and message broker |
-| ClickHouse | Analytical database and event aggregation storage |
-| Docker | Containerization and local infrastructure |
-| Prometheus | Metrics collection |
-| Grafana | Performance monitoring and visualization |
-| OpenTelemetry | Distributed tracing and observability |
-| k6 | Load testing and performance evaluation |
+## Core engineering features
 
-## Core Engineering Features
+1. **Distributed ingestion** — configurable generator (IoT random walk, log-normal
+   clickstream dwell times, GBM market ticks) and an HTTP API that answers `429` under load.
+2. **Partitioning & consumer groups** — key-affine routing; rebalance-aware tasks; recovery from committed offsets.
+3. **Event-time processing** — tumbling/sliding windows, bounded-out-of-orderness watermarks, idle-partition fallback, allowed lateness with window refinement.
+4. **Backpressure** — bounded queues → broker pause/resume with hysteresis → AIMD throttling.
+5. **Fault tolerance** — safe-offset commits, dedup, retry + circuit breaker, dead-letter queue, idempotent versioned sink.
+6. **Real-time analytics** — events/interval, avg/max, distribution by category, throughput, late-arrival stats.
 
-### 1. Distributed Event Ingestion
-
-A Go-based ingestion layer will generate and publish simulated events to Redpanda.
-
-Supported event categories:
-
-- IoT telemetry and sensor readings.
-- Application clickstream events.
-- Financial market tick events.
-
-### 2. Partitioning and Consumer Groups
-
-Events will be distributed across broker partitions to support parallel processing.
-
-The system will explore:
-
-- Partition-based message distribution.
-- Consumer group coordination.
-- Parallel event processing.
-- Partition reassignment and consumer recovery.
-
-### 3. Event-Time Processing
-
-StreamForge will distinguish event time from processing time.
-
-This allows the processing engine to handle events that arrive late or out of order.
-
-Planned capabilities include:
-
-- Tumbling windows.
-- Sliding windows.
-- Late-arriving event handling.
-- Watermark-based processing.
-- Windowed aggregations.
-
-### 4. Backpressure Management
-
-The processing pipeline will implement mechanisms to prevent overloaded consumers from exhausting available resources.
-
-Planned mechanisms include:
-
-- Bounded internal queues.
-- Controlled message consumption.
-- Batch processing.
-- Consumer throttling.
-- Graceful overload handling.
-
-### 5. Fault Tolerance and Recovery
-
-The system will investigate reliable event processing under service failures.
-
-Areas of implementation include:
-
-- Consumer restart and recovery.
-- Message offset management.
-- Duplicate event detection.
-- Idempotent processing.
-- Retry and dead-letter handling.
-
-### 6. Real-Time Analytics
-
-Processed event data will be persisted in ClickHouse for analytical queries.
-
-The analytics layer will expose aggregated information such as:
-
-- Events processed per time interval.
-- Average and maximum observed values.
-- Event distribution across categories.
-- Processing throughput.
-- Late-arrival statistics.
-
-## Performance Evaluation
-
-Performance will be evaluated using reproducible load tests rather than assumed throughput figures.
-
-| Metric | Measurement |
-|---|---|
-| Throughput | Events processed per second |
-| Latency | p50, p95, and p99 processing latency |
-| Resource usage | CPU and memory consumption |
-| Backpressure | Queue depth and consumer lag |
-| Reliability | Event loss and duplicate rates |
-| Recovery | Time taken to resume processing |
-
-Benchmarks will document the hardware, configuration, workload, and test duration used.
-
-## Project Structure
-
-```text
-streamforge/
-├── cmd/
-│   ├── producer/
-│   ├── processor/
-│   └── api/
-├── internal/
-│   ├── ingestion/
-│   ├── streaming/
-│   ├── aggregation/
-│   ├── partitioning/
-│   ├── backpressure/
-│   └── events/
-├── configs/
-├── deployments/
-├── tests/
-│   ├── integration/
-│   └── load/
-├── benchmarks/
-├── docs/
-│   ├── architecture.md
-│   └── adr/
-├── scripts/
-├── .github/
-│   └── workflows/
-├── Dockerfile
-├── Makefile
-├── go.mod
-└── README.md
-```
-
-## Development Roadmap
-
-- [ ] Establish the Go project foundation.
-- [ ] Implement configurable event producers.
-- [ ] Integrate Redpanda as the distributed message broker.
-- [ ] Implement partition-aware stream consumers.
-- [ ] Develop event-time windowing and aggregation.
-- [ ] Handle out-of-order and late-arriving events.
-- [ ] Implement backpressure management.
-- [ ] Add reliable offset management and duplicate handling.
-- [ ] Integrate ClickHouse for analytical storage.
-- [ ] Expose an analytics API.
-- [ ] Integrate Prometheus, Grafana, and OpenTelemetry.
-- [ ] Develop integration and failure-recovery tests.
-- [ ] Conduct load testing and publish reproducible benchmarks.
-
-## Running Locally
-
-Local infrastructure and application startup instructions will be provided as the implementation progresses.
-
-The intended development workflow is:
+## Quick start
 
 ```bash
-docker compose up -d
+make test            # unit tests
+make integration     # chaos end-to-end tests (crash, dupes, sink outage, backpressure)
+make demo            # the 20-second proof above
+make bench           # micro + engine benchmarks
+make build           # binaries in ./bin  (stdlib-only core)
+make redpanda-build  # same, with the Redpanda/Kafka adapter
+make up              # full stack via Docker Compose (see status table!)
 ```
 
-The complete environment will eventually support starting the broker, analytical database, monitoring services, and application components through a unified Docker Compose configuration.
+Analytics API (running in the demo on :8080, or `cmd/api`):
 
-## Engineering Documentation
+```
+GET /v1/summary?since=15m            events / avg / min / max per category
+GET /v1/series?kind=iot&key=sensor-001&since=5m
+GET /v1/throughput?window=60s
+GET /v1/late?since=1h                on-time / late / dropped + max lateness
+GET /metrics   /healthz   /readyz
+```
 
-Architectural decisions, implementation trade-offs, and performance findings will be documented in:
+## Performance
 
-- `docs/architecture.md` — System architecture and component interactions.
-- `docs/adr/` — Architecture Decision Records.
-- `benchmarks/` — Reproducible performance measurements.
+Measured, not assumed. Engine-only (in-memory broker/store, **1 vCPU**): ~105–115 k
+events/s end to end; JSON decode is the dominant cost. Full context and honest
+caveats in [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md). Numbers against real
+Redpanda/ClickHouse are pending.
 
-## Project Goals
+## Project structure
 
-StreamForge is an engineering project focused on understanding and implementing the fundamental principles of distributed event streaming systems.
+```
+cmd/            producer · processor · api · demo
+internal/       events partitioning streaming backpressure aggregation
+                reliability storage processor ingestion api metrics config
+tests/          integration/ (chaos)  load/ (k6)
+benchmarks/     Go benchmarks + recorded results
+deployments/    docker-compose, Prometheus, Grafana
+docs/           architecture.md  adr/
+```
 
-Its primary goals are correctness under concurrency, predictable performance under load, reliable recovery from failures, and scalable event processing.
+## Roadmap
+
+- [x] Go project foundation
+- [x] Configurable event producers
+- [x] Broker abstraction + in-memory broker; Redpanda adapter (compile-verified)
+- [x] Partition-aware stream consumers
+- [x] Event-time windowing and aggregation
+- [x] Out-of-order and late-arriving events
+- [x] Backpressure management
+- [x] Offset management and duplicate handling
+- [x] ClickHouse integration (HTTP)
+- [x] Analytics API
+- [x] Prometheus + Grafana (OpenTelemetry **pending**)
+- [x] Integration and failure-recovery tests
+- [ ] Run against live Redpanda + ClickHouse; publish reproducible benchmarks
+- [ ] OpenTelemetry tracing
+- [ ] Binary encoding (protobuf) to cut decode cost
+
+## Credits
+
+Ideas this project builds on: Akidau et al., *The Dataflow Model* (VLDB 2015) ·
+Lamping & Veach, *Jump Consistent Hash* (2014) · Chiu & Jain, AIMD (1989) ·
+Brooker, *Exponential Backoff and Jitter* (AWS, 2015) · Nygard, *Release It!* ·
+Kreps et al., *Kafka* (NetDB 2011) · franz-go by Travis Bischel.
 
 ## License
 
-This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
+Apache License 2.0 — see [LICENSE](LICENSE).
