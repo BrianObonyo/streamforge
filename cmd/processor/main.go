@@ -22,6 +22,7 @@ import (
 	"github.com/BrianObonyo/streamforge/internal/reliability"
 	"github.com/BrianObonyo/streamforge/internal/storage"
 	"github.com/BrianObonyo/streamforge/internal/streaming"
+	"github.com/BrianObonyo/streamforge/internal/tracing"
 )
 
 func main() {
@@ -40,9 +41,16 @@ func main() {
 		metricsAddr = flag.String("metrics-addr", ":9100", "metrics/health listen address (empty = off)")
 		logLevel    = flag.String("log-level", "info", "debug|info|warn|error")
 	)
+	newTracer := tracing.RegisterFlags(flag.CommandLine)
 	flag.Parse()
 	log := config.Logger(*logLevel)
 	cfg.MemberID = *member
+	cfg.Tracer = newTracer("streamforge-processor", log)
+	defer func() { // flush buffered spans on the way out
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = cfg.Tracer.Shutdown(c)
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -70,6 +78,7 @@ func main() {
 	defer consumer.Close()
 
 	reg := metrics.NewRegistry()
+	cfg.Tracer.RegisterMetrics(reg)
 	p, err := processor.New(cfg, processor.Deps{
 		Consumer: consumer, Sink: store, Metrics: reg, Logger: log,
 		DLQ: &reliability.BrokerDLQ{P: dlqProd, Topic: cfg.Topic + ".dlq"},
@@ -94,6 +103,9 @@ func main() {
 
 	if err := p.Run(ctx); err != nil {
 		log.Error("processor exited", "err", err)
+		c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = cfg.Tracer.Shutdown(c) // os.Exit skips defers, so flush explicitly
+		cancel()
 		os.Exit(1)
 	}
 }

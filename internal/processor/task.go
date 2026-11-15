@@ -2,6 +2,7 @@ package processor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync/atomic"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/BrianObonyo/streamforge/internal/reliability"
 	"github.com/BrianObonyo/streamforge/internal/storage"
 	"github.com/BrianObonyo/streamforge/internal/streaming"
+	"github.com/BrianObonyo/streamforge/internal/tracing"
 )
 
 // partitionTask owns everything about ONE partition: its queue, watermark,
@@ -27,6 +29,7 @@ type partitionTask struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
+	permFails  int   // goroutine-local: consecutive permanent sink failures
 	next       int64 // goroutine-local: one past the last handled offset (-1 = none yet)
 	lastLate   aggregation.LateStats
 	lastLateAt time.Time
@@ -108,7 +111,7 @@ func (t *partitionTask) handle(ctx context.Context, rec streaming.Record) {
 		p.m.latency.Observe(now.Sub(rec.Timestamp).Seconds())
 	}
 
-	ev, err := events.Decode(rec.Value)
+	ev, err := events.DecodeAny(rec.Value) // JSON or binary, sniffed from the first byte
 	if err != nil {
 		p.m.poison.Inc()
 		t.deadLetter(ctx, rec, reliability.ReasonPoison, err)
@@ -126,7 +129,12 @@ func (t *partitionTask) handle(ctx context.Context, rec streaming.Record) {
 		return
 	}
 
-	switch t.agg.Add(ev, rec.Offset, now) {
+	// Only now — after decode, validation and dedup — do we open a span, so traces
+	// describe events that were actually processed (not duplicates or garbage).
+	span := p.cfg.Tracer.StartFromTraceparent(ev.TraceParent, "process "+rec.Topic, tracing.KindConsumer)
+
+	outcome := t.agg.Add(ev, rec.Offset, now)
+	switch outcome {
 	case aggregation.OnTime:
 		p.m.onTime.Inc()
 	case aggregation.Late:
@@ -137,13 +145,22 @@ func (t *partitionTask) handle(ctx context.Context, rec streaming.Record) {
 			t.deadLetter(ctx, rec, reliability.ReasonTooLate, errors.New("event time behind watermark beyond allowed lateness"))
 		}
 	}
+	if span != nil {
+		span.SetAttr("messaging.kafka.partition", rec.Partition)
+		span.SetAttr("messaging.kafka.offset", rec.Offset)
+		span.SetAttr("event.kind", string(ev.Kind))
+		span.SetAttr("outcome", outcome.String())
+		span.SetAttr("event.age_ms", now.Sub(ev.EventTime))
+		span.End()
+	}
 }
 
 // advance is the emit cycle:
 //
 //	Collect (read-only) ─▶ write to sink with retry + circuit breaker
-//	   ├─ success ─▶ Ack (mark clean, GC expired windows) ─▶ publish safe offset
-//	   └─ failure ─▶ leave windows dirty; the same results are due next tick
+//	   ├─ written        ─▶ count rows, then Ack
+//	   ├─ dead-lettered  ─▶ (repeated permanent failure) rows preserved in DLQ, then Ack
+//	   └─ pending        ─▶ leave windows dirty; the same results are due next tick
 //
 // Because Collect doesn't mutate state, a failed write can never lose data; the
 // cost is that the task keeps retrying every tick while the sink is down, and the
@@ -154,25 +171,35 @@ func (t *partitionTask) advance(ctx context.Context) {
 	batch := t.agg.Collect(now, t.tp.Partition)
 
 	if len(batch.Results) > 0 {
+		span := p.cfg.Tracer.StartRoot("sink.write", tracing.KindClient)
 		start := time.Now()
 		err := reliability.Do(ctx, p.cfg.Retry, func() error {
 			return p.breaker.Do(func() error { return p.d.Sink.WriteResults(ctx, batch.Results) })
 		})
 		p.m.sinkLatency.Observe(time.Since(start).Seconds())
-		if err != nil {
-			if ctx.Err() == nil {
-				p.m.sinkErrors.Inc()
-				p.log.Warn("sink write failed; will retry next tick", "tp", t.tp.String(),
-					"rows", len(batch.Results), "breaker", p.breaker.State(), "err", err)
-			}
-			return
+		if span != nil {
+			span.SetAttr("rows", len(batch.Results))
+			span.SetAttr("messaging.kafka.partition", t.tp.Partition)
+			span.RecordError(err)
+			span.End()
 		}
-		for _, r := range batch.Results {
-			if r.Update {
-				p.m.emittedUpdates.Inc()
-			} else {
-				p.m.emitted.Inc()
+
+		switch {
+		case err == nil:
+			t.permFails = 0
+			for _, r := range batch.Results {
+				if r.Update {
+					p.m.emittedUpdates.Inc()
+				} else {
+					p.m.emitted.Inc()
+				}
 			}
+		case ctx.Err() != nil:
+			return // shutting down or revoked: not a sink problem
+		case t.handleSinkFailure(ctx, batch, err):
+			// Dead-lettered: fall through to Ack so the partition is unblocked.
+		default:
+			return // pending: retried next tick
 		}
 	}
 
@@ -182,6 +209,49 @@ func (t *partitionTask) advance(ctx context.Context) {
 		t.safe.Store(t.agg.SafeOffset(t.next))
 	}
 	t.flushLate(ctx, false)
+}
+
+// handleSinkFailure classifies a failed sink write and returns true ONLY when the
+// batch has been dead-lettered and may be acknowledged.
+//
+//	transient  (timeouts, 5xx, breaker open) → leave pending, retry next tick; the
+//	           queue behind us fills and backpressure pauses the broker. Nothing lost.
+//	permanent  (rejected schema/payload)      → leave pending for
+//	           MaxPermanentSinkFailures consecutive ticks, giving an operator the
+//	           chance to fix the cause (restore the table…); then preserve the rows in
+//	           the DLQ and unblock the partition rather than wedge it forever.
+func (t *partitionTask) handleSinkFailure(ctx context.Context, batch aggregation.Batch, err error) bool {
+	p := t.p
+	if !reliability.IsPermanent(err) {
+		p.m.sinkErrors.Inc()
+		p.log.Warn("sink write failed (transient); will retry next tick", "tp", t.tp.String(),
+			"rows", len(batch.Results), "breaker", p.breaker.State(), "err", err)
+		return false
+	}
+	p.m.sinkPermanent.Inc()
+	t.permFails++
+	if t.permFails < p.cfg.MaxPermanentSinkFailures {
+		p.log.Error("sink write failed (PERMANENT); batch kept pending", "tp", t.tp.String(),
+			"attempt", t.permFails, "of", p.cfg.MaxPermanentSinkFailures, "err", err)
+		return false
+	}
+	p.log.Error("sink write failed permanently; dead-lettering batch to unblock partition",
+		"tp", t.tp.String(), "rows", len(batch.Results), "err", err)
+	for _, r := range batch.Results {
+		payload, _ := json.Marshal(r)
+		d := reliability.DeadLetter{Reason: reliability.ReasonSinkFail, Error: err.Error(), Topic: t.tp.Topic,
+			Partition: t.tp.Partition, Offset: -1, Value: payload, FailedAt: p.cfg.Now().UTC()}
+		if derr := p.d.DLQ.Send(ctx, d); derr != nil {
+			p.m.dlqErrors.Inc()
+			// Cannot preserve the rows: keep the batch pending rather than lose them.
+			p.log.Error("cannot dead-letter sink batch; keeping it pending", "err", derr)
+			return false
+		}
+		p.m.dlqSent.Inc()
+		p.m.sinkDeadLettered.Inc()
+	}
+	t.permFails = 0
+	return true
 }
 
 // flushLate persists the DELTA of late-arrival counters since the last flush, at

@@ -62,6 +62,11 @@ type Event struct {
 	EventTime  time.Time         `json:"event_time"`            // source-side timestamp
 	IngestTime time.Time         `json:"ingest_time,omitempty"` // set by the ingestion layer
 	Attrs      map[string]string `json:"attrs,omitempty"`       // free-form dimensions
+	// TraceParent carries a W3C Trace Context ("00-<trace>-<span>-<flags>") so a
+	// distributed trace can follow the event from ingestion through the broker to
+	// the processor. It travels IN the payload (not a record header) so it works
+	// identically on every broker implementation. Empty = untraced.
+	TraceParent string `json:"traceparent,omitempty"`
 }
 
 // ErrInvalid wraps every validation failure so callers can use errors.Is.

@@ -31,7 +31,7 @@ type member struct {
 	done     chan error
 }
 
-func startMember(t *testing.T, b *streaming.MemBroker, id string, sink storage.Sink, dlq reliability.DLQ,
+func startMember(t *testing.T, b streaming.Broker, id string, sink storage.Sink, dlq reliability.DLQ,
 	reg *metrics.Registry, mod func(*processor.Config)) *member {
 	t.Helper()
 	c, err := b.NewConsumer("g", id, topic)
@@ -75,7 +75,10 @@ func produce(t *testing.T, g *ingestion.Generator, pub *ingestion.Publisher, n i
 	t.Helper()
 	for i := 0; i < n; i++ {
 		m := g.Next()
-		if err := pub.PublishRaw(context.Background(), m.Key, m.Value); err != nil {
+		err := pub.PublishRaw(context.Background(), m.Key, m.Value)
+		m.Span.RecordError(err)
+		m.Span.End() // what Generator.Run does after a publish; nil-safe when untraced
+		if err != nil {
 			t.Fatal(err)
 		}
 		switch {

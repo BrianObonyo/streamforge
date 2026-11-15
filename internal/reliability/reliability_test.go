@@ -3,6 +3,7 @@ package reliability
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -127,5 +128,34 @@ func TestMemDLQ(t *testing.T) {
 	_ = q.Send(context.Background(), DeadLetter{Reason: ReasonTooLate})
 	if c := q.CountByReason(); c[ReasonPoison] != 2 || c[ReasonTooLate] != 1 {
 		t.Fatalf("%v", c)
+	}
+}
+
+// The breaker guards AVAILABILITY. A permanent error means the dependency
+// answered (and said no), so it must not count toward tripping.
+func TestBreakerIgnoresPermanentErrors(t *testing.T) {
+	b := NewCircuitBreaker(2, time.Hour)
+	for i := 0; i < 10; i++ {
+		_ = b.Do(func() error { return Permanent(errors.New("bad schema")) })
+	}
+	if b.State() != "closed" {
+		t.Fatalf("breaker tripped on permanent errors: %s", b.State())
+	}
+	for i := 0; i < 2; i++ {
+		_ = b.Do(func() error { return errors.New("connection refused") })
+	}
+	if b.State() != "open" {
+		t.Fatalf("transient errors must still trip it: %s", b.State())
+	}
+}
+
+func TestIsPermanentSurvivesWrapping(t *testing.T) {
+	base := errors.New("x")
+	if IsPermanent(base) || !IsPermanent(Permanent(base)) || !IsPermanent(fmt.Errorf("ctx: %w", Permanent(base))) {
+		t.Fatal("IsPermanent misclassifies")
+	}
+	err := Do(context.Background(), DefaultRetry, func() error { return Permanent(base) })
+	if !IsPermanent(err) || !errors.Is(err, base) {
+		t.Fatalf("Do must preserve the marker AND the cause: %v", err)
 	}
 }

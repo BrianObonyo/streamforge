@@ -144,6 +144,13 @@ func Permanent(err error) error {
 	return permanentError{err}
 }
 
+// IsPermanent reports whether err, or anything it wraps, was marked Permanent.
+// Callers use it to choose between "keep retrying" and "give up / dead-letter".
+func IsPermanent(err error) bool {
+	var p permanentError
+	return errors.As(err, &p)
+}
+
 // Do runs fn, retrying failures per policy. It stops early on ctx cancellation or
 // a Permanent error, and returns the last error wrapped with the attempt count.
 func Do(ctx context.Context, p RetryPolicy, fn func() error) error {
@@ -153,9 +160,8 @@ func Do(ctx context.Context, p RetryPolicy, fn func() error) error {
 		if err = fn(); err == nil {
 			return nil
 		}
-		var perm permanentError
-		if errors.As(err, &perm) {
-			return perm.err
+		if IsPermanent(err) {
+			return err // keep the marker so callers up the stack can still classify it
 		}
 		if i == attempts-1 {
 			break
@@ -251,6 +257,13 @@ func (b *CircuitBreaker) after(err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if err == nil {
+		b.state, b.failures, b.probing = stClosed, 0, false
+		return
+	}
+	// A PERMANENT error (bad schema, rejected payload) proves the dependency is
+	// reachable and answering — the breaker guards availability, not correctness,
+	// so it must not trip on these (that would mask the real error as "circuit open").
+	if IsPermanent(err) {
 		b.state, b.failures, b.probing = stClosed, 0, false
 		return
 	}

@@ -14,6 +14,7 @@ import (
 
 	"github.com/BrianObonyo/streamforge/internal/aggregation"
 	"github.com/BrianObonyo/streamforge/internal/events"
+	"github.com/BrianObonyo/streamforge/internal/reliability"
 )
 
 // CHConfig configures the ClickHouse store.
@@ -100,7 +101,11 @@ func (c *ClickHouse) do(ctx context.Context, query string, params map[string]str
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("clickhouse: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		he := newHTTPError(resp.StatusCode, b)
+		if !he.Retryable() {
+			return nil, reliability.Permanent(he) // retrying an identical bad request is pointless
+		}
+		return nil, he
 	}
 	return b, nil
 }
@@ -175,7 +180,19 @@ func (c *ClickHouse) WriteResults(ctx context.Context, rs []aggregation.Result) 
 		}
 	}
 	q := fmt.Sprintf("INSERT INTO %s.%s FORMAT JSONEachRow", c.cfg.Database, c.cfg.Table)
-	_, err := c.do(ctx, q, nil, &buf)
+	return c.insert(ctx, q, buf.Bytes())
+}
+
+// insert POSTs a batch and SELF-HEALS once if the table or database vanished
+// (dropped by an operator, fresh volume, TTL'd test env): it recreates the schema
+// and retries. Any other error is returned as classified by do().
+func (c *ClickHouse) insert(ctx context.Context, query string, body []byte) error {
+	_, err := c.do(ctx, query, nil, bytes.NewReader(body))
+	if err != nil && isUnknownObject(err) {
+		if herr := c.EnsureSchema(ctx); herr == nil {
+			_, err = c.do(ctx, query, nil, bytes.NewReader(body))
+		}
+	}
 	return err
 }
 
@@ -195,8 +212,7 @@ func (c *ClickHouse) WriteLateStats(ctx context.Context, rows []LateStatRow) err
 		}
 	}
 	q := fmt.Sprintf("INSERT INTO %s.%s FORMAT JSONEachRow", c.cfg.Database, c.cfg.LateTbl)
-	_, err := c.do(ctx, q, nil, &buf)
-	return err
+	return c.insert(ctx, q, buf.Bytes())
 }
 
 // where builds a parameterised WHERE clause. Values go in `params`, never in SQL.

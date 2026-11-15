@@ -69,6 +69,31 @@ type Producer interface {
 	Close() error
 }
 
+// KV is one message in a batch.
+type KV struct{ Key, Value []byte }
+
+// BatchProducer is an optional Producer capability: send many messages in one
+// call so a network broker can pipeline them instead of paying one round trip per
+// message (the difference between ~1 k and ~100 k msgs/s per producer).
+type BatchProducer interface {
+	ProduceBatch(ctx context.Context, topic string, msgs []KV) error
+}
+
+// ProduceBatch sends msgs via the producer's batch path if it has one, else one at
+// a time. A returned error means the batch MAY be partially written; callers that
+// retry should rely on downstream dedup (the processor does).
+func ProduceBatch(ctx context.Context, p Producer, topic string, msgs []KV) error {
+	if bp, ok := p.(BatchProducer); ok {
+		return bp.ProduceBatch(ctx, topic, msgs)
+	}
+	for _, m := range msgs {
+		if _, _, err := p.Produce(ctx, topic, m.Key, m.Value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Consumer is a member of a consumer group.
 type Consumer interface {
 	// Poll returns up to max records from assigned, un-paused partitions. It

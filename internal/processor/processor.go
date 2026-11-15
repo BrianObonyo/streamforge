@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"strconv"
 	"sync"
 	"time"
@@ -105,6 +106,7 @@ func (p *Processor) Run(ctx context.Context) (err error) {
 	p.log.Info("processor started", "topic", p.cfg.Topic, "window", p.cfg.Assigner.Name(),
 		"max_ooo", p.cfg.MaxOutOfOrder, "lateness", p.cfg.AllowedLateness)
 
+	pollFails := 0
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -116,6 +118,7 @@ func (p *Processor) Run(ctx context.Context) (err error) {
 		cancel()
 		switch {
 		case perr == nil:
+			pollFails = 0
 		case ctx.Err() != nil:
 			return nil
 		case errors.Is(perr, context.DeadlineExceeded):
@@ -124,9 +127,15 @@ func (p *Processor) Run(ctx context.Context) (err error) {
 			graceful = false
 			return perr
 		default:
-			p.log.Warn("poll failed", "err", perr)
+			// A broker hiccup (leader election, network blip) is routine: back off
+			// exponentially so we neither spin nor hammer a recovering cluster, and
+			// reset the moment a poll succeeds.
+			pollFails++
+			p.m.pollErrors.Inc()
+			wait := pollBackoff(pollFails)
+			p.log.Warn("poll failed; backing off", "err", perr, "consecutive", pollFails, "wait", wait)
 			select {
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(wait):
 			case <-ctx.Done():
 				return nil
 			}
@@ -146,6 +155,16 @@ func (p *Processor) Run(ctx context.Context) (err error) {
 		}
 		p.maybeCommit(ctx)
 	}
+}
+
+// pollBackoff returns 100 ms · 2^(n-1), capped at 5 s, with ±20 % jitter so a
+// fleet of processors that failed together doesn't retry in lockstep.
+func pollBackoff(n int) time.Duration {
+	d := 100 * time.Millisecond << uint(min(n-1, 6))
+	if d > 5*time.Second {
+		d = 5 * time.Second
+	}
+	return time.Duration(float64(d) * (0.8 + 0.4*rand.Float64()))
 }
 
 // dispatch hands one record to its partition's queue. It returns false only when
@@ -250,8 +269,14 @@ func (p *Processor) commit(ctx context.Context) {
 		return
 	}
 	if err := p.d.Consumer.Commit(ctx, offs); err != nil {
-		// ErrNotAssigned just means a rebalance raced us; next loop reconciles.
-		if !errors.Is(err, streaming.ErrClosed) && ctx.Err() == nil {
+		switch {
+		case errors.Is(err, streaming.ErrNotAssigned):
+			// A rebalance raced us. Benign by design: the new owner resumes from the
+			// last committed offset, and the next loop's reconcile() fixes our view.
+			p.log.Debug("commit fenced by rebalance", "err", err)
+		case errors.Is(err, streaming.ErrClosed) || ctx.Err() != nil:
+			// shutting down or consumer gone: nothing to report
+		default:
 			p.m.commitErrors.Inc()
 			p.log.Warn("commit failed", "err", err)
 		}

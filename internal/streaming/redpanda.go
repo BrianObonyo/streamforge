@@ -25,9 +25,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -52,6 +54,13 @@ func init() {
 		}
 		return &rpBroker{seeds: addrs, admin: admin}, nil
 	})
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if v, err := time.ParseDuration(os.Getenv(key)); err == nil && v > 0 {
+		return v
+	}
+	return def
 }
 
 func (b *rpBroker) Close() error { b.admin.Close(); return nil }
@@ -96,6 +105,16 @@ func (p *rpProducer) Produce(ctx context.Context, topic string, key, value []byt
 	return int(r.Partition), r.Offset, nil
 }
 
+// ProduceBatch hands every record to franz-go in one call; the client batches them
+// per partition and pipelines the requests, then we wait for all acks.
+func (p *rpProducer) ProduceBatch(ctx context.Context, topic string, msgs []KV) error {
+	recs := make([]*kgo.Record, len(msgs))
+	for i, m := range msgs {
+		recs[i] = &kgo.Record{Topic: topic, Key: m.Key, Value: m.Value}
+	}
+	return p.cl.ProduceSync(ctx, recs...).FirstErr()
+}
+
 func (p *rpProducer) Close() error { p.cl.Close(); return nil }
 
 // ---------------------------------------------------------------- consumer
@@ -113,6 +132,12 @@ func (b *rpBroker) NewConsumer(group, _ string, topics ...string) (Consumer, err
 		kgo.SeedBrokers(b.seeds...),
 		kgo.ConsumerGroup(group),
 		kgo.ConsumeTopics(topics...),
+		// Failure detection: if a member dies without leaving (SIGKILL, OOM, power
+		// loss) its partitions sit idle until the broker's session timeout expires.
+		// franz-go's default is 45 s; 10 s with 3 s heartbeats is a common
+		// production setting. Override with SF_KAFKA_SESSION_TIMEOUT (e.g. "30s").
+		kgo.SessionTimeout(envDuration("SF_KAFKA_SESSION_TIMEOUT", 10*time.Second)),
+		kgo.HeartbeatInterval(envDuration("SF_KAFKA_HEARTBEAT_INTERVAL", 3*time.Second)),
 		kgo.DisableAutoCommit(),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()), // brand-new group reads from the beginning
 		kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, m map[string][]int32) { c.update(m, true) }),

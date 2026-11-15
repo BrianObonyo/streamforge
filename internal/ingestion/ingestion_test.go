@@ -226,3 +226,34 @@ func TestRunStopsAtLimit(t *testing.T) {
 		t.Fatalf("broker holds %d records", total)
 	}
 }
+
+// An unknown topic can never succeed: fail immediately instead of burning the
+// whole retry budget.
+func TestPublisherDoesNotRetryPermanentBrokerErrors(t *testing.T) {
+	pub, _, _ := newPub(t)
+	pub.Topic = "no-such-topic"
+	err := pub.Publish(context.Background(), events.Event{ID: "1", Kind: events.KindIoT, Key: "s", Value: 1, EventTime: fixedNow})
+	if !errors.Is(err, streaming.ErrUnknownTopic) {
+		t.Fatalf("err=%v, want ErrUnknownTopic", err)
+	}
+	if pub.retries.Value() != 0 {
+		t.Fatalf("retried a permanent error %d times", pub.retries.Value())
+	}
+}
+
+func TestHTTPDropsMalformedTraceparent(t *testing.T) {
+	pub, _, c := newPub(t)
+	h := &Handler{Pub: pub, Now: func() time.Time { return fixedNow }}
+	body := `{"kind":"iot","key":"s","value":1,"event_time":"` + fixedNow.Format(time.RFC3339) + `","traceparent":"not-a-trace"}`
+	if rr := post(h, body); rr.Code != http.StatusAccepted {
+		t.Fatalf("a bad traceparent must not cost the client its data: %d", rr.Code)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _ = c.Poll(ctx, 1)
+	recs, _ := c.Poll(ctx, 10)
+	ev, _ := events.Decode(recs[0].Value)
+	if ev.TraceParent != "" {
+		t.Fatalf("garbage traceparent was propagated: %q", ev.TraceParent)
+	}
+}

@@ -132,3 +132,85 @@ func BenchmarkPipeline(b *testing.B) {
 		})
 	}
 }
+
+// ---- codec comparison (see ADR-0005) --------------------------------------
+
+func sampleEvent() events.Event {
+	return events.Event{ID: "9f2c1d7e8a4b4c0d9e1f2a3b4c5d6e7f", Kind: events.KindMarket, Key: "BTC-USD", Value: 64123.5,
+		EventTime: base, IngestTime: base.Add(3 * time.Millisecond), Attrs: map[string]string{"currency": "USD"}}
+}
+
+func BenchmarkDecodeJSON(b *testing.B) {
+	raw, _ := events.Encode(sampleEvent())
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	for i := 0; i < b.N; i++ {
+		_, _ = events.DecodeAny(raw)
+	}
+}
+
+func BenchmarkDecodeBinary(b *testing.B) {
+	raw, _ := events.EncodeBinary(sampleEvent())
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	for i := 0; i < b.N; i++ {
+		_, _ = events.DecodeAny(raw)
+	}
+}
+
+func BenchmarkEncodeJSON(b *testing.B) {
+	e := sampleEvent()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = events.Encode(e)
+	}
+}
+
+func BenchmarkEncodeBinary(b *testing.B) {
+	e := sampleEvent()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = events.EncodeBinary(e)
+	}
+}
+
+// BenchmarkPipelineCodec: same engine-only pipeline as BenchmarkPipeline, per codec.
+func BenchmarkPipelineCodec(b *testing.B) {
+	for _, codec := range []events.Codec{events.CodecJSON, events.CodecBinary} {
+		b.Run(string(codec), func(b *testing.B) {
+			ctx := context.Background()
+			br := streaming.NewMemBroker()
+			_ = br.CreateTopic(ctx, "t", 1)
+			prod, _ := br.NewProducer(partitioning.Hash{})
+			g := ingestion.NewGenerator(ingestion.GenConfig{Seed: 1, Codec: codec})
+			kvs := make([]streaming.KV, b.N)
+			for i := range kvs {
+				m := g.Next()
+				kvs[i] = streaming.KV{Key: m.Key, Value: m.Value}
+			}
+			cons, _ := br.NewConsumer("g", "m", "t")
+			p, err := processor.New(processor.Config{Topic: "t", Group: "g", MemberID: "m", WindowSize: time.Second,
+				MaxOutOfOrder: time.Second, AllowedLateness: time.Second, IdleTimeout: 200 * time.Millisecond},
+				processor.Deps{Consumer: cons, Sink: storage.NewMemStore()})
+			if err != nil {
+				b.Fatal(err)
+			}
+			rctx, cancel := context.WithCancel(ctx)
+			done := make(chan error, 1)
+			go func() { done <- p.Run(rctx) }()
+			b.ResetTimer()
+			_ = streaming.ProduceBatch(ctx, prod, "t", kvs)
+			for {
+				s := p.Stats()
+				if int(s.OnTime+s.Late+s.TooLate+s.Duplicates+s.Invalid+s.Poison) >= b.N {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			b.StopTimer()
+			cancel()
+			<-done
+			b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "events/s")
+		})
+	}
+}

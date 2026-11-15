@@ -9,6 +9,7 @@ import (
 
 	"github.com/BrianObonyo/streamforge/internal/backpressure"
 	"github.com/BrianObonyo/streamforge/internal/events"
+	"github.com/BrianObonyo/streamforge/internal/tracing"
 )
 
 const (
@@ -91,9 +92,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Trace propagation: a W3C `traceparent` header applies to events that don't
+	// carry their own. Malformed values are silently dropped (never a 400): a bad
+	// tracing header must not cost a client its data.
+	hdrTP := r.Header.Get("traceparent")
+
 	var resp response
 	for i := range batch {
 		ev := batch[i]
+		if ev.TraceParent == "" {
+			ev.TraceParent = hdrTP
+		}
+		if _, ok := tracing.ParseTraceparent(ev.TraceParent); !ok {
+			ev.TraceParent = ""
+		}
 		if ev.ID == "" {
 			ev.ID = events.NewID() // server-assigned ids are fine, but clients should send their own for dedup
 		}

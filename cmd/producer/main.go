@@ -21,11 +21,13 @@ import (
 
 	"github.com/BrianObonyo/streamforge/internal/backpressure"
 	"github.com/BrianObonyo/streamforge/internal/config"
+	"github.com/BrianObonyo/streamforge/internal/events"
 	"github.com/BrianObonyo/streamforge/internal/ingestion"
 	"github.com/BrianObonyo/streamforge/internal/metrics"
 	"github.com/BrianObonyo/streamforge/internal/partitioning"
 	"github.com/BrianObonyo/streamforge/internal/reliability"
 	"github.com/BrianObonyo/streamforge/internal/streaming"
+	"github.com/BrianObonyo/streamforge/internal/tracing"
 )
 
 func main() {
@@ -46,10 +48,20 @@ func main() {
 		poison      = flag.Float64("poison", 0.005, "probability of an undecodable message")
 		serve       = flag.String("serve", "", "HTTP ingestion/metrics listen address, e.g. :8081 (empty = off)")
 		httpLimit   = flag.Float64("http-rate-limit", 0, "HTTP ingestion limit in events/sec (0 = unlimited)")
+		codecName   = flag.String("codec", config.String("SF_CODEC", "json"), "wire format: json|binary")
 		logLevel    = flag.String("log-level", "info", "debug|info|warn|error")
 	)
+	newTracer := tracing.RegisterFlags(flag.CommandLine)
 	flag.Parse()
 	log := config.Logger(*logLevel)
+	codec, err := events.ParseCodec(*codecName)
+	fatal(log, err)
+	tracer := newTracer("streamforge-producer", log)
+	defer func() { // flush buffered spans on the way out
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tracer.Shutdown(c)
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -74,7 +86,9 @@ func main() {
 	defer prod.Close()
 
 	reg := metrics.NewRegistry()
+	tracer.RegisterMetrics(reg)
 	pub := ingestion.NewPublisher(prod, *topic, reliability.DefaultRetry, reg)
+	pub.Codec, pub.Tracer = codec, tracer
 
 	var wg sync.WaitGroup
 	if *serve != "" {
@@ -105,6 +119,7 @@ func main() {
 	if *generate {
 		g := ingestion.NewGenerator(ingestion.GenConfig{
 			Rate: *rate, Seed: *seed, DisorderProb: *disorder, MaxDelay: *maxDelay, DupProb: *dup, PoisonProb: *poison,
+			Codec: codec, Tracer: tracer,
 		})
 		log.Info("generating", "rate", *rate, "seed", *seed, "disorder", *disorder, "dup", *dup, "poison", *poison)
 		n, err := g.Run(ctx, pub, *count)

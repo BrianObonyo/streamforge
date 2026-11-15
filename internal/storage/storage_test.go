@@ -174,3 +174,5 @@ func TestClickHouseSeriesDecodesTimes(t *testing.T) {
 		t.Fatalf("pts=%+v err=%v", pts, err)
 	}
 }
+
+func stringsReader(s string) *strings.Reader { return strings.NewReader(s) }

@@ -160,6 +160,16 @@ type gaugeFunc struct {
 	fn func() float64
 }
 
+// CounterFunc registers a counter whose value is read from fn at scrape time — for
+// monotonic totals that already live elsewhere (e.g. the tracer's drop count).
+// fn MUST be monotonically non-decreasing or Prometheus rate() will misbehave.
+func (r *Registry) CounterFunc(name, help string, l Labels, fn func() float64) {
+	g := r.getOrCreate(name, help, "counter", l, func() series { return &gaugeFunc{fn: fn} }).(*gaugeFunc)
+	g.mu.Lock()
+	g.fn = fn
+	g.mu.Unlock()
+}
+
 func (g *gaugeFunc) write(w io.Writer, name, labels string) {
 	g.mu.Lock()
 	fn := g.fn

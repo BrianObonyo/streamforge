@@ -29,6 +29,7 @@ import (
 	"github.com/BrianObonyo/streamforge/internal/api"
 	"github.com/BrianObonyo/streamforge/internal/backpressure"
 	"github.com/BrianObonyo/streamforge/internal/config"
+	"github.com/BrianObonyo/streamforge/internal/events"
 	"github.com/BrianObonyo/streamforge/internal/ingestion"
 	"github.com/BrianObonyo/streamforge/internal/metrics"
 	"github.com/BrianObonyo/streamforge/internal/partitioning"
@@ -36,6 +37,7 @@ import (
 	"github.com/BrianObonyo/streamforge/internal/reliability"
 	"github.com/BrianObonyo/streamforge/internal/storage"
 	"github.com/BrianObonyo/streamforge/internal/streaming"
+	"github.com/BrianObonyo/streamforge/internal/tracing"
 )
 
 const topic = "events"
@@ -58,8 +60,10 @@ func main() {
 		httpAddr   = flag.String("http", ":8080", "analytics API + /metrics address (empty = off)")
 		storeKind  = flag.String("store", "memory", "memory|clickhouse")
 		chURL      = flag.String("clickhouse-url", "http://localhost:8123", "ClickHouse URL (when -store clickhouse)")
+		codecName  = flag.String("codec", "json", "wire format: json|binary")
 		logLevel   = flag.String("log-level", "warn", "debug|info|warn|error")
 	)
+	newTracer := tracing.RegisterFlags(flag.CommandLine)
 	flag.Parse()
 	cfg.Topic, cfg.Group = topic, "demo"
 	if cfg.WindowSize == 10*time.Second { // the production default is too coarse for a short demo
@@ -68,6 +72,18 @@ func main() {
 	cfg.MaxOutOfOrder = *maxDelay + 500*time.Millisecond // slack just above the worst injected delay
 	cfg.CommitInterval = 200 * time.Millisecond
 	log := config.Logger(*logLevel)
+	codec, cerr := events.ParseCodec(*codecName)
+	if cerr != nil {
+		fmt.Fprintln(os.Stderr, "fatal:", cerr)
+		os.Exit(1)
+	}
+	tracer := newTracer("streamforge-demo", log)
+	cfg.Tracer = tracer
+	defer func() {
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tracer.Shutdown(c)
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -84,6 +100,7 @@ func main() {
 	store, err := storage.Open(ctx, *storeKind, storage.CHConfig{URL: *chURL})
 	die(err)
 	reg := metrics.NewRegistry()
+	tracer.RegisterMetrics(reg)
 	reg.GaugeFunc("sf_consumer_lag", "Records the group has yet to commit past.", nil, func() float64 {
 		var n int64
 		for _, v := range broker.Lag(cfg.Group, topic) {
@@ -144,8 +161,9 @@ func main() {
 	// ---- producer
 	prod, _ := broker.NewProducer(partitioning.Hash{})
 	pub := ingestion.NewPublisher(prod, topic, reliability.DefaultRetry, reg)
+	pub.Codec, pub.Tracer = codec, tracer
 	gen := ingestion.NewGenerator(ingestion.GenConfig{Rate: *rate, Seed: *seed,
-		DisorderProb: *disorder, MaxDelay: *maxDelay, DupProb: *dup, PoisonProb: *poison})
+		DisorderProb: *disorder, MaxDelay: *maxDelay, DupProb: *dup, PoisonProb: *poison, Codec: codec, Tracer: tracer})
 	limiter := backpressure.NewTokenBucket(*rate, max(*rate/10, 1))
 
 	var produced, unique, dups, poisoned int64
@@ -159,7 +177,10 @@ func main() {
 				return
 			}
 			m := gen.Next()
-			if pub.PublishRaw(ctx, m.Key, m.Value) != nil {
+			perr := pub.PublishRaw(ctx, m.Key, m.Value)
+			m.Span.RecordError(perr)
+			m.Span.End()
+			if perr != nil {
 				return
 			}
 			pmu.Lock()

@@ -10,6 +10,8 @@ import (
 
 	"github.com/BrianObonyo/streamforge/internal/backpressure"
 	"github.com/BrianObonyo/streamforge/internal/events"
+	"github.com/BrianObonyo/streamforge/internal/streaming"
+	"github.com/BrianObonyo/streamforge/internal/tracing"
 )
 
 // GenConfig controls the synthetic workload.
@@ -24,6 +26,9 @@ type GenConfig struct {
 	MaxDelay     time.Duration // upper bound of that delay
 	DupProb      float64       // re-send a recently emitted message byte-for-byte
 	PoisonProb   float64       // emit undecodable garbage
+
+	Codec  events.Codec    // wire format (zero = JSON)
+	Tracer *tracing.Tracer // optional: sampled events get a publish span and a traceparent
 
 	Now func() time.Time // injectable clock; defaults to time.Now
 }
@@ -51,6 +56,7 @@ type Message struct {
 	Key, Value  []byte
 	Event       *events.Event // nil for poison pills
 	Dup, Poison bool
+	Span        *tracing.Span // non-nil when this message is part of a sampled trace; End it after publishing
 }
 
 var tickers = []string{"BTC-USD", "ETH-USD", "SOL-USD", "AAPL", "MSFT", "NVDA", "EUR-USD", "XAU-USD", "KES-USD", "TSLA"}
@@ -98,7 +104,7 @@ func (g *Generator) Next() Message {
 	// Duplicate: replay an earlier message verbatim (same ID ⇒ dedup target).
 	if g.cfg.DupProb > 0 && len(g.recent) > 0 && g.rng.Float64() < g.cfg.DupProb {
 		m := g.recent[g.rng.Intn(len(g.recent))]
-		m.Dup = true
+		m.Dup, m.Span = true, nil
 		return m
 	}
 
@@ -140,12 +146,25 @@ func (g *Generator) Next() Message {
 		ev.Attrs["currency"] = "USD"
 	}
 
-	b, _ := json.Marshal(ev) // cannot fail: all fields are plain values
-	m := Message{Key: []byte(ev.Key), Value: b, Event: &ev}
+	// Sampled events carry a traceparent pointing at their publish span, so the
+	// processor's span becomes its child and one trace spans the whole pipeline.
+	span := g.cfg.Tracer.StartRoot("publish", tracing.KindProducer)
+	if span != nil {
+		ev.TraceParent = span.Context().String()
+		span.SetAttr("event.kind", string(ev.Kind))
+		span.SetAttr("event.key", ev.Key)
+	}
+	b, err := events.EncodeWith(g.cfg.Codec, ev)
+	if err != nil { // only an oversized field can fail; fall back so the stream never stalls
+		b, _ = json.Marshal(ev)
+	}
+	m := Message{Key: []byte(ev.Key), Value: b, Event: &ev, Span: span}
+	stored := m
+	stored.Span = nil // a replayed duplicate must not reuse (or re-End) the original's span
 	if len(g.recent) < recentRing {
-		g.recent = append(g.recent, m)
+		g.recent = append(g.recent, stored)
 	} else {
-		g.recent[g.ri%recentRing] = m
+		g.recent[g.ri%recentRing] = stored
 		g.ri++
 	}
 	return m
@@ -162,24 +181,53 @@ func round(v float64, places int) float64 {
 
 // Run publishes messages at cfg.Rate until ctx ends or limit messages have been
 // sent (limit <= 0 means unlimited). It returns the number published.
+//
+// Messages are sent in batches sized to about 5 ms of traffic (1 at low rates, up
+// to 500 when unthrottled), so a network broker is not hit with one round trip per
+// message. The rate limiter is still applied per message, so pacing is unchanged.
 func (g *Generator) Run(ctx context.Context, pub *Publisher, limit int) (int, error) {
 	var limiter *backpressure.TokenBucket
+	batchSize := 500
 	if g.cfg.Rate > 0 {
 		limiter = backpressure.NewTokenBucket(g.cfg.Rate, max(g.cfg.Rate/10, 1))
+		batchSize = int(min(500, max(1, g.cfg.Rate/200)))
 	}
 	n := 0
-	for limit <= 0 || n < limit {
+	batch := make([]streaming.KV, 0, batchSize)
+	spans := make([]*tracing.Span, 0, batchSize)
+	flush := func() error {
+		err := pub.PublishBatch(ctx, batch)
+		for _, s := range spans {
+			s.RecordError(err)
+			s.End()
+		}
+		if err == nil {
+			n += len(batch)
+		}
+		batch, spans = batch[:0], spans[:0]
+		return err
+	}
+	for limit <= 0 || n+len(batch) < limit {
 		if err := limiter.Wait(ctx, 1); err != nil {
+			_ = flush()   // best effort: send what we already generated
 			return n, nil // normal shutdown
 		}
 		m := g.Next()
-		if err := pub.PublishRaw(ctx, m.Key, m.Value); err != nil {
-			if ctx.Err() != nil {
-				return n, nil
-			}
-			return n, err
+		batch = append(batch, streaming.KV{Key: m.Key, Value: m.Value})
+		if m.Span != nil {
+			spans = append(spans, m.Span)
 		}
-		n++
+		if len(batch) >= batchSize {
+			if err := flush(); err != nil {
+				if ctx.Err() != nil {
+					return n, nil
+				}
+				return n, err
+			}
+		}
+	}
+	if err := flush(); err != nil && ctx.Err() == nil {
+		return n, err
 	}
 	return n, nil
 }

@@ -41,6 +41,7 @@ import (
 
 	"github.com/BrianObonyo/streamforge/internal/aggregation"
 	"github.com/BrianObonyo/streamforge/internal/reliability"
+	"github.com/BrianObonyo/streamforge/internal/tracing"
 )
 
 // Config holds every tunable of a Processor.
@@ -72,6 +73,14 @@ type Config struct {
 	Retry            reliability.RetryPolicy // sink write retries
 	BreakerThreshold int                     // consecutive sink failures before the breaker opens
 	BreakerOpenFor   time.Duration
+
+	// MaxPermanentSinkFailures is how many CONSECUTIVE permanent (non-retryable)
+	// sink errors a partition tolerates before dead-lettering the stuck batch. Until
+	// then the batch stays pending so an operator fix (e.g. restoring a table) loses
+	// nothing; after it, the partition is unblocked and the rows are preserved in the DLQ.
+	MaxPermanentSinkFailures int
+
+	Tracer *tracing.Tracer // optional; nil disables tracing
 
 	ThrottleCeiling float64 // max events/sec the AIMD controller may allow; 0 disables throttling
 	DLQTooLate      bool    // also dead-letter events beyond allowed lateness
@@ -113,6 +122,7 @@ func (c *Config) ApplyDefaults() error {
 	if c.Retry.MaxAttempts == 0 {
 		c.Retry = reliability.DefaultRetry
 	}
+	defInt(&c.MaxPermanentSinkFailures, 5)
 	defInt(&c.BreakerThreshold, 5)
 	def(&c.BreakerOpenFor, 2*time.Second)
 	if c.Now == nil {

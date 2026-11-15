@@ -2,6 +2,8 @@ name: ci
 on:
   push: { branches: [main] }
   pull_request:
+  schedule: [{ cron: "0 5 * * 1" }]   # weekly: catches upstream image/tag drift
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -13,16 +15,68 @@ jobs:
         run: make lint
       - name: unit tests (race detector)
         run: go test -race -count=1 ./internal/...
-      - name: integration (crash, duplicates, sink outage, backpressure)
+      - name: integration — crash, duplicates, sink outage, backpressure, tracing, codecs
         run: go test -race -count=1 ./tests/...
       - name: build both variants
         run: make build && make redpanda-build
       - name: demo proves exactness
         run: go run ./cmd/demo -duration 10s -kill-at 4s -revive-at 7s -rate 2000 -http ""
+      - name: fuzz (30 s each)
+        run: |
+          go test -run xxx -fuzz FuzzDecodeBinary -fuzztime 30s ./internal/events/
+          go test -run xxx -fuzz FuzzParseTraceparent -fuzztime 30s ./internal/tracing/
+
+  kafka-adapter:           # real franz-go client + Kafka wire protocol (kfake)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.22" }
+      - run: go test -tags redpanda -race -count=1 ./internal/streaming/ ./tests/integration/
+
+  clickhouse-live:         # the production store against the SAME image tag compose pins
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        env: { CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1" }
+        ports: ["8123:8123"]
+        options: >-
+          --health-cmd "wget -qO- http://localhost:8123/ping" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.22" }
+      - run: SF_TEST_CLICKHOUSE_URL=http://localhost:8123 go test -count=1 -v -run Live ./internal/storage/
+
+  redpanda-live:           # the adapter against a REAL Redpanda broker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.22" }
+      - name: start Redpanda
+        run: |
+          docker run -d --name rp -p 19092:19092 docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
+            redpanda start --mode=dev-container --smp=1 --memory=1G \
+            --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092 \
+            --advertise-kafka-addr=internal://localhost:9092,external://localhost:19092
+          for i in $(seq 1 40); do docker exec rp rpk cluster health 2>/dev/null | grep -q 'Healthy:.*true' && break; sleep 2; done
+      - run: SF_TEST_BROKERS=localhost:19092 go test -tags redpanda -count=1 -v -run LiveBroker ./internal/streaming/
+
+  compose-static:          # flags, env vars and scrape targets in the compose stack match the code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.22" }
+      - run: make redpanda-build && pip install pyyaml && python3 scripts/check-compose.py ./bin
+
   staticcheck:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: "1.22" }
-      - run: go install honnef.co/go/tools/cmd/staticcheck@latest && staticcheck ./...
+      - run: go install honnef.co/go/tools/cmd/staticcheck@latest && staticcheck ./... && staticcheck -tags redpanda ./...

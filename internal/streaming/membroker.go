@@ -170,9 +170,35 @@ func (p *memProducer) Produce(ctx context.Context, topic string, key, value []by
 	if err := ctx.Err(); err != nil {
 		return 0, 0, err
 	}
+	p.b.mu.Lock()
+	defer p.b.mu.Unlock()
+	part, off, err := p.appendLocked(topic, key, value)
+	if err == nil {
+		p.b.broadcastLocked()
+	}
+	return part, off, err
+}
+
+// ProduceBatch appends all messages under ONE lock acquisition and wakes
+// consumers once — far cheaper than per-message locking and broadcasting.
+func (p *memProducer) ProduceBatch(ctx context.Context, topic string, msgs []KV) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	p.b.mu.Lock()
+	defer p.b.mu.Unlock()
+	defer p.b.broadcastLocked()
+	for _, m := range msgs {
+		if _, _, err := p.appendLocked(topic, m.Key, m.Value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// appendLocked appends one record; the caller holds b.mu and broadcasts.
+func (p *memProducer) appendLocked(topic string, key, value []byte) (int, int64, error) {
 	b := p.b
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.closed {
 		return 0, 0, ErrClosed
 	}
@@ -199,7 +225,6 @@ func (p *memProducer) Produce(ctx context.Context, topic string, key, value []by
 		Timestamp: b.now(),
 	}
 	t.parts[idx] = append(t.parts[idx], rec)
-	b.broadcastLocked()
 	return idx, rec.Offset, nil
 }
 

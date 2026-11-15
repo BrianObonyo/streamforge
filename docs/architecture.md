@@ -106,7 +106,40 @@ exactly this reason.
   back by retained windows — it is not pure processing delay.
 * Watermark idle-advance can misclassify a stalled producer as a quiet one.
 
-## 6. Testing strategy
+## 6. Error-handling matrix
+
+Every failure has a defined detection, response and signal. "Pending" means results
+are kept in memory and retried — nothing is dropped.
+
+| Failure | Detected by | Response | Signal |
+|---|---|---|---|
+| Undecodable record | `DecodeAny` error | DLQ `poison_undecodable`; offset still advances | `sf_events_processed_total{outcome="poison"}` |
+| Invalid event (NaN, future date…) | `Validate` | DLQ `invalid_event`; **never reaches the watermark** | `outcome="invalid"` |
+| Duplicate event | dedup cache | dropped | `outcome="duplicate"` |
+| Late, within lateness | aggregator | accepted; window re-emitted with higher version | `outcome="late"` |
+| Late, beyond lateness | aggregator | excluded (optionally DLQ `too_late`) | `outcome="too_late"` |
+| Sink transient (5xx, timeout, breaker open) | `HTTPError.Retryable`, breaker | jittered retry; batch pending; queue fills → broker paused | `sf_sink_errors_total{class="transient"}` |
+| Sink permanent (4xx) | `reliability.IsPermanent` | pending for N ticks, then rows → DLQ `sink_failure`, partition unblocked | `class="permanent"`, `sf_sink_rows_dead_lettered_total` |
+| ClickHouse table/db missing | code 60 / 81 | recreate schema, retry once | — |
+| Broker poll error | `Poll` returns error | exponential backoff 100 ms–5 s, ±20 % jitter | `sf_poll_errors_total` |
+| Publish transient | `Do` retry | jittered backoff; batch retry may duplicate (dedup covers it) | `sf_ingest_retries_total` |
+| Publish permanent (unknown topic) | `ErrUnknownTopic` | fail fast, no retry | `sf_ingest_failed_total` |
+| Commit fenced (rebalance race) | `ErrNotAssigned` | ignored; next loop reconciles | — |
+| Processor killed (-9) | broker session timeout | partitions reassigned; replay from safe offset; version rule keeps results exact | `sf_rebalances_total` |
+| Overload | queue high-water | pause partition at broker; AIMD shrinks rate | `sf_paused_partitions`, `sf_throttle_rate` |
+| Telemetry backend down | exporter | spans dropped, **never blocks pipeline** | tracer `Dropped`/`ExportErrors` |
+
+Rationale and trade-offs: ADR-0007.
+
+## 7. Wire formats and tracing
+
+* **Two wire formats** share a topic: JSON (default, debuggable) and a compact binary
+  format (7.6× faster decode); consumers sniff the first byte. ADR-0005.
+* **Distributed tracing:** W3C `traceparent` travels in the event payload; spans are
+  exported as OTLP/HTTP JSON to any collector. One trace follows an event from the
+  producer process through the broker into the processor process. ADR-0006.
+
+## 8. Testing strategy
 
 * Unit tests per package, including property-style checks (jump-hash key movement,
   monoid order-independence, backoff bounds).
@@ -114,5 +147,12 @@ exactly this reason.
   **hard-killed group member** — then asserts stored totals equal unique events
   exactly. Also asserts backpressure engages and graceful shutdown commits to log end.
 * `cmd/demo` repeats that proof interactively.
-* ClickHouse code is tested against an `httptest` server (wire format,
-  parameterisation); **not yet** against a real ClickHouse.
+* ClickHouse code is tested twice: against an `httptest` stub (wire format,
+  parameterisation) and, when `SF_TEST_CLICKHOUSE_URL` is set, against a **real
+  server** (DDL, `FINAL` dedup of unmerged versions, typed parameters, injection
+  inertness, self-healing).
+* The Redpanda adapter is tested with `-tags redpanda` against franz-go's `kfake`
+  (real client, real Kafka protocol), including the full chaos pipeline.
+* `scripts/e2e-local.sh` runs the real binaries as separate processes against real
+  ClickHouse, a Kafka-protocol broker, Prometheus, k6 and an OTel Collector.
+* What remains unverified is listed explicitly in `docs/VERIFICATION.md`.
