@@ -35,7 +35,7 @@ func TestBinaryRoundTrip(t *testing.T) {
 }
 
 func TestBinaryPreservesSpecialFloats(t *testing.T) {
-	for _, v := range []float64{math.NaN(), math.Inf(-1), -0.0, math.SmallestNonzeroFloat64} {
+	for _, v := range []float64{math.NaN(), math.Inf(-1), math.Copysign(0, -1), math.SmallestNonzeroFloat64} {
 		e := full()
 		e.Value = v
 		b, _ := EncodeBinary(e)
