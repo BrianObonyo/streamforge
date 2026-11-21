@@ -15,6 +15,7 @@ Reproduce it with `scripts/e2e-local.sh` (see "How to reproduce").
 |---|---|---|
 | ClickHouse store | ✅ **verified on a real server** | ClickHouse **26.8.37 LTS** (official build) |
 | Redpanda adapter | 🟡 **verified on a real Kafka-protocol cluster; not on Redpanda itself** | franz-go **kfake** (real client, real wire protocol) |
+| Kafka TLS/SASL client configuration | ✅ **protocol-tested, not production-cluster-tested** | kfake: TLS + PLAIN, SCRAM-SHA-256/512, invalid credentials |
 | Full pipeline as separate processes | ✅ verified | real ClickHouse + Kafka-protocol broker + 2 processors + producer + API |
 | Crash recovery (`kill -9`) | ✅ verified, exact | real processes, real ClickHouse |
 | k6 load script | ✅ verified (smoke scale) | k6 **2.4.0** against the real producer binary |
@@ -69,6 +70,18 @@ been run**.
 A defect found here: franz-go's default 45 s session timeout would leave a killed
 member's partitions orphaned for 45 s. The adapter now defaults to 10 s / 3 s
 heartbeat (`SF_KAFKA_SESSION_TIMEOUT`, `SF_KAFKA_HEARTBEAT_INTERVAL`).
+
+### Kafka TLS and SASL
+
+The adapter applies optional TLS and SASL configuration to admin, producer, and
+consumer clients. Build-tagged tests verify TLS certificate validation, PLAIN over
+TLS, SCRAM-SHA-256, SCRAM-SHA-512, rejection of invalid credentials, and invalid
+configuration handling against kfake. `PLAIN` without TLS fails during adapter
+initialization.
+
+This confirms the client-side Kafka protocol behavior only. It does not verify
+certificate provisioning, ACLs, listener configuration, or authentication policy
+on a real Redpanda deployment.
 
 ## 3. End-to-end: real processes, real infrastructure
 

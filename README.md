@@ -82,8 +82,9 @@ Decisions and trade-offs: [`docs/adr/`](docs/adr/).
 3. **Event-time processing** — tumbling/sliding windows, bounded-out-of-orderness watermarks, idle-partition fallback, allowed lateness with window refinement.
 4. **Backpressure** — bounded queues → broker pause/resume with hysteresis → AIMD throttling.
 5. **Fault tolerance** — safe-offset commits, dedup, jittered retry + circuit breaker, dead-letter queue, idempotent versioned sink, **transient-vs-permanent error classification** (a persistent sink failure dead-letters its rows instead of wedging a partition), self-healing ClickHouse schema, exponential poll backoff. Full matrix: [`docs/architecture.md` §6](docs/architecture.md).
-6. **Observability** — Prometheus metrics, a 10-panel Grafana dashboard, and **distributed tracing** (W3C `traceparent` in the payload → OTLP/HTTP, dependency-free).
-7. **Real-time analytics** — events/interval, avg/max, distribution by category, throughput, late-arrival stats.
+6. **Kafka security** — optional TLS (custom CA and mutual TLS) plus SASL PLAIN and SCRAM-SHA-256/512; PLAIN requires TLS. Configure credentials through environment variables or a secret manager. See [`docs/security.md`](docs/security.md).
+7. **Observability** — Prometheus metrics, a 10-panel Grafana dashboard, and **distributed tracing** (W3C `traceparent` in the payload → OTLP/HTTP, dependency-free).
+8. **Real-time analytics** — events/interval, avg/max, distribution by category, throughput, late-arrival stats.
 
 ## Quick start
 

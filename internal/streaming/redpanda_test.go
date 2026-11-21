@@ -4,8 +4,17 @@ package streaming
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -37,6 +46,247 @@ func newKafka(t *testing.T) Broker {
 	}
 	t.Cleanup(func() { _ = b.Close() })
 	return b
+}
+
+func TestKafkaSASLAuthentication(t *testing.T) {
+	tests := []struct {
+		mechanism string
+		tls       bool
+	}{
+		{mechanism: "PLAIN", tls: true},
+		{mechanism: "SCRAM-SHA-256"},
+		{mechanism: "SCRAM-SHA-512"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.mechanism, func(t *testing.T) {
+			const user, password = "streamforge-test", "test-password"
+			opts := []kfake.Opt{
+				kfake.NumBrokers(1),
+				kfake.EnableSASL(),
+				kfake.Superuser(tt.mechanism, user, password),
+			}
+			if tt.tls {
+				serverTLS, caPath, _, _ := testBrokerTLS(t)
+				opts = append(opts, kfake.TLS(serverTLS))
+				t.Setenv("SF_KAFKA_TLS", "true")
+				t.Setenv("SF_KAFKA_TLS_CA", caPath)
+			} else {
+				t.Setenv("SF_KAFKA_TLS", "")
+				t.Setenv("SF_KAFKA_TLS_CA", "")
+			}
+			t.Setenv("SF_KAFKA_TLS_CERT", "")
+			t.Setenv("SF_KAFKA_TLS_KEY", "")
+			t.Setenv("SF_KAFKA_TLS_SERVER_NAME", "")
+			t.Setenv("SF_KAFKA_SASL_MECHANISM", tt.mechanism)
+			t.Setenv("SF_KAFKA_SASL_USERNAME", user)
+			t.Setenv("SF_KAFKA_SASL_PASSWORD", password)
+
+			cluster, err := kfake.NewCluster(opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(cluster.Close)
+			broker, err := Open("redpanda", cluster.ListenAddrs())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = broker.Close() })
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := broker.CreateTopic(ctx, "authenticated", 1); err != nil {
+				t.Fatalf("authenticated admin request failed: %v", err)
+			}
+			producer, err := broker.NewProducer(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer producer.Close()
+			if _, _, err := producer.Produce(ctx, "authenticated", []byte("key"), []byte("value")); err != nil {
+				t.Fatalf("authenticated produce failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestKafkaSASLRejectsBadCredentials(t *testing.T) {
+	const user, password = "streamforge-test", "test-password"
+	t.Setenv("SF_KAFKA_TLS", "")
+	t.Setenv("SF_KAFKA_TLS_CA", "")
+	t.Setenv("SF_KAFKA_TLS_CERT", "")
+	t.Setenv("SF_KAFKA_TLS_KEY", "")
+	t.Setenv("SF_KAFKA_TLS_SERVER_NAME", "")
+	t.Setenv("SF_KAFKA_SASL_MECHANISM", "SCRAM-SHA-256")
+	t.Setenv("SF_KAFKA_SASL_USERNAME", user)
+	t.Setenv("SF_KAFKA_SASL_PASSWORD", "wrong-password")
+	cluster, err := kfake.NewCluster(
+		kfake.NumBrokers(1),
+		kfake.EnableSASL(),
+		kfake.Superuser("SCRAM-SHA-256", user, password),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cluster.Close)
+	broker, err := Open("redpanda", cluster.ListenAddrs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer broker.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := broker.CreateTopic(ctx, "authenticated", 1); err == nil {
+		t.Fatal("broker accepted invalid SASL credentials")
+	}
+}
+
+func TestKafkaMutualTLS(t *testing.T) {
+	serverTLS, caPath, clientCertPath, clientKeyPath := testBrokerTLS(t)
+	t.Setenv("SF_KAFKA_TLS", "true")
+	t.Setenv("SF_KAFKA_TLS_CA", caPath)
+	t.Setenv("SF_KAFKA_TLS_CERT", clientCertPath)
+	t.Setenv("SF_KAFKA_TLS_KEY", clientKeyPath)
+	t.Setenv("SF_KAFKA_TLS_SERVER_NAME", "")
+	t.Setenv("SF_KAFKA_SASL_MECHANISM", "")
+	t.Setenv("SF_KAFKA_SASL_USERNAME", "")
+	t.Setenv("SF_KAFKA_SASL_PASSWORD", "")
+	serverTLS.ClientAuth = tls.RequireAndVerifyClientCert
+
+	cluster, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.TLS(serverTLS))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cluster.Close)
+	broker, err := Open("redpanda", cluster.ListenAddrs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer broker.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := broker.CreateTopic(ctx, "mutual-tls", 1); err != nil {
+		t.Fatalf("mTLS-authenticated admin request failed: %v", err)
+	}
+}
+
+func TestRedpandaSecurityConfigurationValidation(t *testing.T) {
+	tests := []struct {
+		name, mechanism, username, password, tls, cert, key string
+	}{
+		{name: "unknown mechanism", mechanism: "UNSUPPORTED", username: "u", password: "p"},
+		{name: "missing credentials", mechanism: "SCRAM-SHA-256", username: "u"},
+		{name: "credentials without mechanism", username: "u", password: "p"},
+		{name: "plain without TLS", mechanism: "PLAIN", username: "u", password: "p"},
+		{name: "client certificate without key", cert: "client.crt"},
+		{name: "invalid TLS boolean", tls: "enabled"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("SF_KAFKA_TLS", tt.tls)
+			t.Setenv("SF_KAFKA_TLS_CA", "")
+			t.Setenv("SF_KAFKA_TLS_CERT", tt.cert)
+			t.Setenv("SF_KAFKA_TLS_KEY", tt.key)
+			t.Setenv("SF_KAFKA_TLS_SERVER_NAME", "")
+			t.Setenv("SF_KAFKA_SASL_MECHANISM", tt.mechanism)
+			t.Setenv("SF_KAFKA_SASL_USERNAME", tt.username)
+			t.Setenv("SF_KAFKA_SASL_PASSWORD", tt.password)
+			if _, err := redpandaClientOptionsFromEnv(); err == nil {
+				t.Fatal("invalid configuration was accepted")
+			}
+		})
+	}
+}
+
+func testBrokerTLS(t *testing.T) (*tls.Config, string, string, string) {
+	t.Helper()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "StreamForge test CA"},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	rootPool := x509.NewCertPool()
+	rootPool.AddCert(caCert)
+
+	serverKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    caTemplate.NotBefore,
+		NotAfter:     caTemplate.NotAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	serverDER, err := x509.CreateCertificate(rand.Reader, serverTemplate, caCert, &serverKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverDER})
+	serverKeyDER, err := x509.MarshalPKCS8PrivateKey(serverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: serverKeyDER})
+	serverCert, err := tls.X509KeyPair(serverPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clientKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: "streamforge-client"},
+		NotBefore:    caTemplate.NotBefore,
+		NotAfter:     caTemplate.NotAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	clientDER, err := x509.CreateCertificate(rand.Reader, clientTemplate, caCert, &clientKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientDER})
+	clientKeyDER, err := x509.MarshalPKCS8PrivateKey(clientKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: clientKeyDER})
+
+	dir := t.TempDir()
+	caPath := dir + string(os.PathSeparator) + "ca.pem"
+	clientCertPath := dir + string(os.PathSeparator) + "client.crt"
+	clientKeyPath := dir + string(os.PathSeparator) + "client.key"
+	for path, data := range map[string][]byte{
+		caPath: certPEM, clientCertPath: clientPEM, clientKeyPath: clientKeyPEM,
+	} {
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	serverTLS := &tls.Config{Certificates: []tls.Certificate{serverCert}, ClientCAs: rootPool}
+	return serverTLS, caPath, clientCertPath, clientKeyPath
 }
 
 func pollUntil(t *testing.T, c Consumer, want int, d time.Duration) []Record {

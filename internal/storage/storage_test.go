@@ -27,8 +27,8 @@ func TestMemStoreHighestVersionWins(t *testing.T) {
 	s := NewMemStore()
 	ctx := context.Background()
 	_ = s.WriteResults(ctx, []aggregation.Result{res(0, events.KindIoT, "a", 10, 100)})
-	_ = s.WriteResults(ctx, []aggregation.Result{res(0, events.KindIoT, "a", 4, 40)})   // partial replay: must lose
 	_ = s.WriteResults(ctx, []aggregation.Result{res(0, events.KindIoT, "a", 12, 120)}) // late refinement: must win
+	_ = s.WriteResults(ctx, []aggregation.Result{res(0, events.KindIoT, "a", 4, 40)})   // stale replay arrives last: must lose
 	rows := s.Rows()
 	if len(rows) != 1 || rows[0].Stats.Count != 12 {
 		t.Fatalf("rows=%+v", rows)

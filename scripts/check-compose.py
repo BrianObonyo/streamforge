@@ -40,7 +40,7 @@ for name, svc in services.items():
     if "entrypoint" in svc:
         entry = os.path.basename(svc["entrypoint"][0])
     args = [str(a) for a in svc.get("command", [])]
-    binpath = bindir / entry
+    binpath = bindir / (entry + ".exe" if os.name == "nt" else entry)
     if not binpath.exists():
         bad(f"{name}: binary {binpath} not built"); continue
     env = dict(os.environ, SF_BROKER="memory", SF_STORE="memory", HOSTNAME=name)
@@ -61,7 +61,7 @@ for name, svc in services.items():
         ok(f"{name}: `{entry} {' '.join(args)}` started and kept running")
 
 print("3. environment variables are actually consumed")
-src = "".join(p.read_text() for p in root.rglob("*.go") if "_test" not in p.name)
+src = "".join(p.read_text(encoding="utf-8") for p in root.rglob("*.go") if "_test" not in p.name)
 envs = set()
 for svc in services.values():
     e = svc.get("environment", {})

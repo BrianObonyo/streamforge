@@ -18,15 +18,21 @@ package streaming
 //     is therefore ignored here; same-key → same-partition still holds.
 //   - Rebalancing: the group protocol is the broker's (cooperative-sticky is the
 //     franz-go default). OnPartitionsAssigned/Revoked callbacks feed Assignment().
+//   - Security: optional TLS and SASL PLAIN / SCRAM credentials are configured
+//     from environment variables and shared across admin, producer and consumer
+//     clients.
 //   - Offsets: auto-commit is DISABLED. Only the processor's safe offsets are
 //     committed, which is the entire basis of its crash-recovery guarantee.
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,13 +40,17 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
+	"github.com/twmb/franz-go/pkg/sasl"
+	"github.com/twmb/franz-go/pkg/sasl/plain"
+	"github.com/twmb/franz-go/pkg/sasl/scram"
 
 	"github.com/BrianObonyo/streamforge/internal/partitioning"
 )
 
 type rpBroker struct {
-	seeds []string
-	admin *kgo.Client
+	seeds      []string
+	admin      *kgo.Client
+	clientOpts []kgo.Opt
 }
 
 func init() {
@@ -48,12 +58,95 @@ func init() {
 		if len(addrs) == 0 {
 			return nil, fmt.Errorf("redpanda: at least one seed broker address is required")
 		}
-		admin, err := kgo.NewClient(kgo.SeedBrokers(addrs...))
+		clientOpts, err := redpandaClientOptionsFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		admin, err := kgo.NewClient(append([]kgo.Opt{kgo.SeedBrokers(addrs...)}, clientOpts...)...)
 		if err != nil {
 			return nil, fmt.Errorf("redpanda: %w", err)
 		}
-		return &rpBroker{seeds: addrs, admin: admin}, nil
+		return &rpBroker{seeds: addrs, admin: admin, clientOpts: clientOpts}, nil
 	})
+}
+
+func redpandaClientOptionsFromEnv() ([]kgo.Opt, error) {
+	tlsEnabled, err := strconv.ParseBool(envDefault("SF_KAFKA_TLS", "false"))
+	if err != nil {
+		return nil, fmt.Errorf("redpanda: SF_KAFKA_TLS must be a boolean: %w", err)
+	}
+	caPath := os.Getenv("SF_KAFKA_TLS_CA")
+	certPath, keyPath := os.Getenv("SF_KAFKA_TLS_CERT"), os.Getenv("SF_KAFKA_TLS_KEY")
+	serverName := os.Getenv("SF_KAFKA_TLS_SERVER_NAME")
+	if (certPath == "") != (keyPath == "") {
+		return nil, fmt.Errorf("redpanda: SF_KAFKA_TLS_CERT and SF_KAFKA_TLS_KEY must be configured together")
+	}
+	tlsEnabled = tlsEnabled || caPath != "" || certPath != "" || serverName != ""
+
+	var opts []kgo.Opt
+	if tlsEnabled {
+		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: serverName}
+		if caPath != "" {
+			caPEM, err := os.ReadFile(caPath)
+			if err != nil {
+				return nil, fmt.Errorf("redpanda: read Kafka TLS CA: %w", err)
+			}
+			roots, err := x509.SystemCertPool()
+			if err != nil {
+				return nil, fmt.Errorf("redpanda: load system certificate pool: %w", err)
+			}
+			if roots == nil {
+				roots = x509.NewCertPool()
+			}
+			if ok := roots.AppendCertsFromPEM(caPEM); !ok {
+				return nil, fmt.Errorf("redpanda: Kafka TLS CA file contains no valid certificates")
+			}
+			tlsConfig.RootCAs = roots
+		}
+		if certPath != "" {
+			cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+			if err != nil {
+				return nil, fmt.Errorf("redpanda: load Kafka TLS client certificate: %w", err)
+			}
+			tlsConfig.Certificates = []tls.Certificate{cert}
+		}
+		opts = append(opts, kgo.DialTLSConfig(tlsConfig))
+	}
+
+	mechanismName := os.Getenv("SF_KAFKA_SASL_MECHANISM")
+	username, password := os.Getenv("SF_KAFKA_SASL_USERNAME"), os.Getenv("SF_KAFKA_SASL_PASSWORD")
+	if mechanismName == "" {
+		if username != "" || password != "" {
+			return nil, fmt.Errorf("redpanda: SF_KAFKA_SASL_MECHANISM is required when SASL credentials are configured")
+		}
+		return opts, nil
+	}
+	if username == "" || password == "" {
+		return nil, fmt.Errorf("redpanda: SASL mechanism requires both SF_KAFKA_SASL_USERNAME and SF_KAFKA_SASL_PASSWORD")
+	}
+
+	var mechanism sasl.Mechanism
+	switch mechanismName {
+	case "PLAIN":
+		if !tlsEnabled {
+			return nil, fmt.Errorf("redpanda: SASL PLAIN requires TLS; set SF_KAFKA_TLS=true")
+		}
+		mechanism = plain.Auth{User: username, Pass: password}.AsMechanism()
+	case "SCRAM-SHA-256":
+		mechanism = scram.Auth{User: username, Pass: password}.AsSha256Mechanism()
+	case "SCRAM-SHA-512":
+		mechanism = scram.Auth{User: username, Pass: password}.AsSha512Mechanism()
+	default:
+		return nil, fmt.Errorf("redpanda: unsupported SF_KAFKA_SASL_MECHANISM %q (want PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512)", mechanismName)
+	}
+	return append(opts, kgo.SASL(mechanism)), nil
+}
+
+func envDefault(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return v
+	}
+	return def
 }
 
 func envDuration(key string, def time.Duration) time.Duration {
@@ -88,9 +181,11 @@ func (b *rpBroker) CreateTopic(ctx context.Context, name string, partitions int)
 type rpProducer struct{ cl *kgo.Client }
 
 func (b *rpBroker) NewProducer(_ partitioning.Partitioner) (Producer, error) {
-	cl, err := kgo.NewClient(kgo.SeedBrokers(b.seeds...),
+	opts := append([]kgo.Opt{kgo.SeedBrokers(b.seeds...)}, b.clientOpts...)
+	opts = append(opts,
 		kgo.RequiredAcks(kgo.AllISRAcks()), // wait for replication: an acked event survives a broker loss
 	)
+	cl, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -128,8 +223,8 @@ type rpConsumer struct {
 
 func (b *rpBroker) NewConsumer(group, _ string, topics ...string) (Consumer, error) {
 	c := &rpConsumer{owned: map[TopicPartition]struct{}{}}
-	cl, err := kgo.NewClient(
-		kgo.SeedBrokers(b.seeds...),
+	opts := append([]kgo.Opt{kgo.SeedBrokers(b.seeds...)}, b.clientOpts...)
+	opts = append(opts,
 		kgo.ConsumerGroup(group),
 		kgo.ConsumeTopics(topics...),
 		// Failure detection: if a member dies without leaving (SIGKILL, OOM, power
@@ -144,6 +239,7 @@ func (b *rpBroker) NewConsumer(group, _ string, topics ...string) (Consumer, err
 		kgo.OnPartitionsRevoked(func(_ context.Context, _ *kgo.Client, m map[string][]int32) { c.update(m, false) }),
 		kgo.OnPartitionsLost(func(_ context.Context, _ *kgo.Client, m map[string][]int32) { c.update(m, false) }),
 	)
+	cl, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, err
 	}

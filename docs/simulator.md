@@ -29,3 +29,8 @@ options produce the same sorted JSON report.
 This tool exercises StreamForge's deterministic processing primitives in process;
 it does not emulate broker networking, consumer-group coordination, processor
 scheduling, or TLS/SASL. Those remain separate verification targets.
+
+The CI suite separately guards two replay invariants: an open window must hold
+back its safe commit offset, and a stale aggregate written after a newer version
+must not replace it. The crash-recovery integration test checks the end-to-end
+count after a processor is killed and its records are replayed.
