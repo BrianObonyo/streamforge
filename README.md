@@ -153,14 +153,13 @@ docs/           architecture.md  VERIFICATION.md  e2e-run.log  adr/ (7 decisions
 - [x] ClickHouse integration (HTTP)
 - [x] Analytics API
 - [x] Prometheus + Grafana + OpenTelemetry tracing
-- [x] Kafka TLS/SASL client configuration (kfake verified; real-cluster verification remains)
+- [x] Kafka TLS/SASL client configuration (TLS + SCRAM live-broker coverage added to CI)
 - [x] Durable ClickHouse-backed processor checkpoints (crash-before-commit integration verified)
 - [x] Integration and failure-recovery tests (incl. real-process crash test)
 - [x] Verified against a real ClickHouse and a real Kafka-protocol cluster
 - [x] Binary wire format (7.6× faster decode)
 - [ ] Extend the deterministic replay simulator with broker/process failure scenarios
-- [ ] Verify checkpoint recovery and TLS/SASL against a real Redpanda deployment
-- [ ] Run the adapter against **real Redpanda** (`make verify-live`, CI `redpanda-live`)
+- [ ] Pass the live Redpanda + ClickHouse checkpoint recovery and TLS/SCRAM CI job
 - [ ] Execute the Docker Compose stack once; load the dashboard into Grafana
 - [ ] Multi-core and real-cluster throughput benchmarks
 

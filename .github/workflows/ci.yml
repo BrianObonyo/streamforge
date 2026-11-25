@@ -52,18 +52,76 @@ jobs:
 
   redpanda-live:           # the adapter against a REAL Redpanda broker
     runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        env: { CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1" }
+        ports: ["8123:8123"]
+        options: >-
+          --health-cmd "wget -qO- http://localhost:8123/ping" --health-interval 5s
+          --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: "1.22" }
+      - name: Generate ephemeral test credential
+        run: |
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          echo "SF_CI_SASL_PASSWORD=$password" >> "$GITHUB_ENV"
+      - name: Generate temporary broker certificate
+        run: |
+          cert_dir="$RUNNER_TEMP/redpanda-certs"
+          work_dir="$RUNNER_TEMP/redpanda-cert-work"
+          mkdir -p "$cert_dir"
+          mkdir -p "$work_dir"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout "$work_dir/ca.key" -out "$work_dir/ca.crt" \
+            -subj "/CN=StreamForge CI test CA"
+          openssl req -newkey rsa:2048 -nodes \
+            -keyout "$cert_dir/broker.key" -out "$cert_dir/broker.csr" \
+            -subj "/CN=localhost"
+          printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > "$work_dir/broker.ext"
+          openssl x509 -req -days 1 -sha256 \
+            -in "$cert_dir/broker.csr" \
+            -CA "$work_dir/ca.crt" -CAkey "$work_dir/ca.key" -CAcreateserial \
+            -out "$cert_dir/broker.crt" -extfile "$work_dir/broker.ext"
+          cp "$work_dir/ca.crt" "$cert_dir/ca.crt"
+          rm "$cert_dir/broker.csr"
+          chmod 644 "$cert_dir/ca.crt" "$cert_dir/broker.crt" "$cert_dir/broker.key"
       - name: start Redpanda
         run: |
-          docker run -d --name rp -p 19092:19092 docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
-            redpanda start --mode=dev-container --smp=1 --memory=1G \
+          docker run -d --name rp -p 19092:19092 \
+            -v "$RUNNER_TEMP/redpanda-certs:/etc/redpanda/certs:ro" \
+            -v "$GITHUB_WORKSPACE/.github/redpanda-secure.yaml:/etc/redpanda/redpanda.yaml:ro" \
+            docker.redpanda.com/redpandadata/redpanda:v24.2.7 \
+            redpanda start --config=/etc/redpanda/redpanda.yaml --mode=dev-container --smp=1 --memory=1G \
             --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092 \
             --advertise-kafka-addr=internal://localhost:9092,external://localhost:19092
-          for i in $(seq 1 40); do docker exec rp rpk cluster health 2>/dev/null | grep -q 'Healthy:.*true' && break; sleep 2; done
-      - run: SF_TEST_BROKERS=localhost:19092 go test -tags redpanda -count=1 -v -run LiveBroker ./internal/streaming/
+          healthy=0
+          for i in $(seq 1 40); do
+            if docker exec rp rpk cluster health 2>/dev/null | grep -q 'Healthy:.*true'; then healthy=1; break; fi
+            sleep 2
+          done
+          test "$healthy" = 1
+          docker exec rp rpk security user create streamforge-ci \
+            -p "$SF_CI_SASL_PASSWORD" --mechanism SCRAM-SHA-256
+          docker exec rp rpk cluster config set superusers '["streamforge-ci"]'
+          docker exec rp rpk cluster config set enable_sasl true
+      - name: authenticated broker and durable checkpoint recovery
+        run: |
+          SF_TEST_BROKERS=localhost:19092 \
+          SF_TEST_CLICKHOUSE_URL=http://localhost:8123 \
+          SF_KAFKA_SASL_MECHANISM=SCRAM-SHA-256 \
+          SF_KAFKA_SASL_USERNAME=streamforge-ci \
+          SF_KAFKA_SASL_PASSWORD="$SF_CI_SASL_PASSWORD" \
+          SF_KAFKA_TLS=true \
+          SF_KAFKA_TLS_CA="$RUNNER_TEMP/redpanda-certs/ca.crt" \
+          SF_TEST_REQUIRE_SASL=true \
+          SF_TEST_REQUIRE_TLS=true \
+            go test -tags redpanda -race -count=1 -v \
+              -run 'LiveBroker|LiveCheckpoint' \
+              ./internal/streaming/ ./tests/integration/
 
   compose-static:          # flags, env vars and scrape targets in the compose stack match the code
     runs-on: ubuntu-latest

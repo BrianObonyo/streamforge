@@ -456,13 +456,21 @@ func TestKafkaProduceToUnknownTopicFails(t *testing.T) {
 //
 //	SF_TEST_BROKERS=localhost:19092 go test -tags redpanda -run LiveBroker -v ./internal/streaming
 //
-// It is skipped when SF_TEST_BROKERS is unset. This is the one test that has NOT
-// been run in the environment this repository was authored in (no Redpanda
-// available there); everything else in this file ran against kfake.
+// It is skipped when SF_TEST_BROKERS is unset. When SF_TEST_REQUIRE_SASL=true,
+// the test also requires SASL credentials and exercises the authenticated listener.
 func TestLiveBrokerSmoke(t *testing.T) {
 	addrs := os.Getenv("SF_TEST_BROKERS")
 	if addrs == "" {
 		t.Skip("SF_TEST_BROKERS not set")
+	}
+	if os.Getenv("SF_TEST_REQUIRE_SASL") == "true" &&
+		(os.Getenv("SF_KAFKA_SASL_MECHANISM") == "" ||
+			os.Getenv("SF_KAFKA_SASL_USERNAME") == "" ||
+			os.Getenv("SF_KAFKA_SASL_PASSWORD") == "") {
+		t.Fatal("live broker security test requires SASL mechanism, username, and password")
+	}
+	if os.Getenv("SF_TEST_REQUIRE_TLS") == "true" && os.Getenv("SF_KAFKA_TLS") != "true" {
+		t.Fatal("live broker security test requires TLS")
 	}
 	b, err := Open("redpanda", strings.Split(addrs, ","))
 	if err != nil {

@@ -39,7 +39,8 @@ retention for old consumer groups and partitions.
   provide a state migration; the fingerprint prevents unsafe implicit restores.
 - This is not a transaction spanning ClickHouse and Kafka. The snapshot is durable
   before the offset commit; a failed commit is retried by restoring the snapshot.
-- Integration coverage uses the in-memory checkpoint store to simulate a crash
-  after snapshot persistence but before Kafka offset commit. ClickHouse request
-  encoding/decoding is unit-tested; a live multi-processor ClickHouse checkpoint
-  recovery run remains a deployment verification task.
+- Integration coverage uses the in-memory checkpoint store and also includes a
+  live-service test that combines ClickHouse checkpoints with a Redpanda consumer
+  crash/restart. The `redpanda-live` CI job runs that test against the pinned
+  service images; the job itself must pass in GitHub Actions before claiming
+  production-cluster verification.
