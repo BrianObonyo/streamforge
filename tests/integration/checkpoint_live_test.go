@@ -197,8 +197,9 @@ func startLiveCheckpointProcessor(t *testing.T, consumer streaming.Consumer, top
 	t.Helper()
 	cfg := processor.Config{
 		Topic: topic, Group: group, MemberID: fmt.Sprintf("live-%d", time.Now().UnixNano()),
-		WindowSize: time.Second, MaxOutOfOrder: 0, AllowedLateness: time.Minute,
-		IdleTimeout: 0, TickInterval: 20 * time.Millisecond, CommitInterval: time.Hour,
+		WindowSize: time.Second, MaxOutOfOrder: 500 * time.Millisecond, // nonzero avoids the 2s default; the final event closes the prior window
+		AllowedLateness: time.Minute,
+		IdleTimeout:     0, TickInterval: 20 * time.Millisecond, CommitInterval: time.Hour,
 		CheckpointInterval: 25 * time.Millisecond,
 		Retry:              reliability.RetryPolicy{MaxAttempts: 1},
 	}
