@@ -16,6 +16,7 @@ Reproduce it with `scripts/e2e-local.sh` (see "How to reproduce").
 | ClickHouse store | ✅ **verified on a real server** | ClickHouse **26.8.37 LTS** (official build) |
 | Redpanda adapter | 🟡 **verified on a real Kafka-protocol cluster; not on Redpanda itself** | franz-go **kfake** (real client, real wire protocol) |
 | Kafka TLS/SASL client configuration | ✅ **protocol-tested, not production-cluster-tested** | kfake: TLS + PLAIN, SCRAM-SHA-256/512, invalid credentials |
+| Processor state checkpointing | ✅ **crash-before-commit behavior tested** | in-memory checkpoint store integration; ClickHouse HTTP read/write unit tests |
 | Full pipeline as separate processes | ✅ verified | real ClickHouse + Kafka-protocol broker + 2 processors + producer + API |
 | Crash recovery (`kill -9`) | ✅ verified, exact | real processes, real ClickHouse |
 | k6 load script | ✅ verified (smoke scale) | k6 **2.4.0** against the real producer binary |
@@ -82,6 +83,21 @@ initialization.
 This confirms the client-side Kafka protocol behavior only. It does not verify
 certificate provisioning, ACLs, listener configuration, or authentication policy
 on a real Redpanda deployment.
+
+### Processor state checkpoints
+
+The processor saves a versioned partition snapshot to `processor_checkpoints`
+before making its next processed offset committable. A crash-recovery integration
+test deliberately disables periodic broker commits, waits until the snapshot
+covers the input, kills the processor, and verifies a successor restores and
+commits the checkpoint offset without changing exact stored counts. Aggregator and
+deduper snapshots are unit-tested independently. ClickHouse checkpoint
+parameterization, JSON encoding, and decoding are exercised with an HTTP test
+server.
+
+Not verified: checkpoint recovery against a real ClickHouse plus real Redpanda
+cluster, multi-replica failure timing, or checkpoint-table retention/compaction
+under sustained load.
 
 ## 3. End-to-end: real processes, real infrastructure
 

@@ -82,9 +82,10 @@ Decisions and trade-offs: [`docs/adr/`](docs/adr/).
 3. **Event-time processing** — tumbling/sliding windows, bounded-out-of-orderness watermarks, idle-partition fallback, allowed lateness with window refinement.
 4. **Backpressure** — bounded queues → broker pause/resume with hysteresis → AIMD throttling.
 5. **Fault tolerance** — safe-offset commits, dedup, jittered retry + circuit breaker, dead-letter queue, idempotent versioned sink, **transient-vs-permanent error classification** (a persistent sink failure dead-letters its rows instead of wedging a partition), self-healing ClickHouse schema, exponential poll backoff. Full matrix: [`docs/architecture.md` §6](docs/architecture.md).
-6. **Kafka security** — optional TLS (custom CA and mutual TLS) plus SASL PLAIN and SCRAM-SHA-256/512; PLAIN requires TLS. Configure credentials through environment variables or a secret manager. See [`docs/security.md`](docs/security.md).
-7. **Observability** — Prometheus metrics, a 10-panel Grafana dashboard, and **distributed tracing** (W3C `traceparent` in the payload → OTLP/HTTP, dependency-free).
-8. **Real-time analytics** — events/interval, avg/max, distribution by category, throughput, late-arrival stats.
+6. **Durable state checkpoints** — ClickHouse-backed partition snapshots of windows, watermarks and dedup state are saved before advancing broker offsets. See [`docs/checkpoints.md`](docs/checkpoints.md).
+7. **Kafka security** — optional TLS (custom CA and mutual TLS) plus SASL PLAIN and SCRAM-SHA-256/512; PLAIN requires TLS. Configure credentials through environment variables or a secret manager. See [`docs/security.md`](docs/security.md).
+8. **Observability** — Prometheus metrics, a 10-panel Grafana dashboard, and **distributed tracing** (W3C `traceparent` in the payload → OTLP/HTTP, dependency-free).
+9. **Real-time analytics** — events/interval, avg/max, distribution by category, throughput, late-arrival stats.
 
 ## Quick start
 
@@ -152,12 +153,13 @@ docs/           architecture.md  VERIFICATION.md  e2e-run.log  adr/ (7 decisions
 - [x] ClickHouse integration (HTTP)
 - [x] Analytics API
 - [x] Prometheus + Grafana + OpenTelemetry tracing
+- [x] Kafka TLS/SASL client configuration (kfake verified; real-cluster verification remains)
+- [x] Durable ClickHouse-backed processor checkpoints (crash-before-commit integration verified)
 - [x] Integration and failure-recovery tests (incl. real-process crash test)
 - [x] Verified against a real ClickHouse and a real Kafka-protocol cluster
 - [x] Binary wire format (7.6× faster decode)
 - [ ] Extend the deterministic replay simulator with broker/process failure scenarios
-- [ ] Add TLS, SASL, and service authentication for broker connections
-- [ ] Add durable state checkpointing for windows and deduplication
+- [ ] Verify checkpoint recovery and TLS/SASL against a real Redpanda deployment
 - [ ] Run the adapter against **real Redpanda** (`make verify-live`, CI `redpanda-live`)
 - [ ] Execute the Docker Compose stack once; load the dashboard into Grafana
 - [ ] Multi-core and real-cluster throughput benchmarks

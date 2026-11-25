@@ -19,11 +19,12 @@ import (
 
 // Deps are the collaborators a Processor needs.
 type Deps struct {
-	Consumer streaming.Consumer
-	Sink     storage.Sink
-	DLQ      reliability.DLQ   // optional (defaults to discarding)
-	Metrics  *metrics.Registry // optional
-	Logger   *slog.Logger      // optional
+	Consumer    streaming.Consumer
+	Sink        storage.Sink
+	Checkpoints storage.CheckpointStore // optional; when set, snapshots precede offset commits
+	DLQ         reliability.DLQ         // optional (defaults to discarding)
+	Metrics     *metrics.Registry       // optional
+	Logger      *slog.Logger            // optional
 }
 
 // Processor is one consumer-group member. Create with New, run with Run.
@@ -64,10 +65,11 @@ func New(cfg Config, d Deps) (*Processor, error) {
 	}
 	p := &Processor{
 		cfg: cfg, d: d, log: d.Logger.With("member", cfg.MemberID, "group", cfg.Group),
-		m:         newMetrics(d.Metrics),
-		tasks:     map[streaming.TopicPartition]*partitionTask{},
-		committed: map[streaming.TopicPartition]int64{},
-		breaker:   reliability.NewCircuitBreaker(cfg.BreakerThreshold, cfg.BreakerOpenFor),
+		m:          newMetrics(d.Metrics),
+		tasks:      map[streaming.TopicPartition]*partitionTask{},
+		committed:  map[streaming.TopicPartition]int64{},
+		lastCommit: cfg.Now(),
+		breaker:    reliability.NewCircuitBreaker(cfg.BreakerThreshold, cfg.BreakerOpenFor),
 	}
 	if cfg.ThrottleCeiling > 0 {
 		p.throttle = backpressure.NewTokenBucket(cfg.ThrottleCeiling, cfg.ThrottleCeiling/10)
@@ -111,7 +113,9 @@ func (p *Processor) Run(ctx context.Context) (err error) {
 		if ctx.Err() != nil {
 			return nil
 		}
-		p.reconcile()
+		if err := p.reconcile(ctx); err != nil {
+			return err
+		}
 
 		pollCtx, cancel := context.WithTimeout(ctx, p.cfg.PollTimeout)
 		recs, perr := p.d.Consumer.Poll(pollCtx, p.cfg.PollBatch)
@@ -146,7 +150,9 @@ func (p *Processor) Run(ctx context.Context) (err error) {
 			// partition DURING Poll. Dropping its first records because no task
 			// existed yet would silently skip them (the broker already advanced
 			// our read position).
-			p.reconcile()
+			if err := p.reconcile(ctx); err != nil {
+				return err
+			}
 			for _, r := range recs {
 				if !p.dispatch(ctx, r) {
 					return nil
@@ -176,6 +182,9 @@ func (p *Processor) dispatch(ctx context.Context, r streaming.Record) bool {
 		// re-read from the committed offset, so dropping here loses nothing.
 		return true
 	}
+	if resumeOffset := t.resumeOffset.Load(); resumeOffset >= 0 && r.Offset < resumeOffset {
+		return true // the durable checkpoint already includes this prefetched record
+	}
 	if err := p.throttle.Wait(ctx, 1); err != nil {
 		return false
 	}
@@ -185,7 +194,7 @@ func (p *Processor) dispatch(ctx context.Context, r streaming.Record) bool {
 }
 
 // reconcile aligns running tasks with the consumer's current assignment.
-func (p *Processor) reconcile() {
+func (p *Processor) reconcile(ctx context.Context) error {
 	want := map[streaming.TopicPartition]struct{}{}
 	for _, tp := range p.d.Consumer.Assignment() {
 		if tp.Topic == p.cfg.Topic {
@@ -201,7 +210,9 @@ func (p *Processor) reconcile() {
 	}
 	for tp := range want {
 		if p.tasks[tp] == nil {
-			p.assign(tp)
+			if err := p.assign(ctx, tp); err != nil {
+				return err
+			}
 			changed = true
 		}
 	}
@@ -209,10 +220,33 @@ func (p *Processor) reconcile() {
 		p.m.rebalances.Inc()
 		p.log.Info("assignment changed", "partitions", len(p.tasks))
 	}
+	return nil
 }
 
-func (p *Processor) assign(tp streaming.TopicPartition) {
+func (p *Processor) assign(ctx context.Context, tp streaming.TopicPartition) error {
 	t := newTask(p, tp)
+	if p.d.Checkpoints != nil {
+		cp, ok, err := p.d.Checkpoints.LoadCheckpoint(ctx, p.cfg.Group, tp.Topic, tp.Partition)
+		if err != nil {
+			return fmt.Errorf("load checkpoint for %s: %w", tp, err)
+		}
+		if ok {
+			if cp.Group != p.cfg.Group || cp.Topic != tp.Topic || cp.Partition != tp.Partition {
+				return fmt.Errorf("processor: checkpoint identity mismatch for %s", tp)
+			}
+			if cp.Config != checkpointConfigID(p.cfg) {
+				return fmt.Errorf("processor: checkpoint configuration mismatch for %s; keep window, watermark, and dedup settings unchanged or use a new consumer group", tp)
+			}
+			if err := t.restoreCheckpoint(cp.Offset, cp.State); err != nil {
+				return fmt.Errorf("restore checkpoint for %s: %w", tp, err)
+			}
+			if err := p.d.Consumer.Commit(ctx, map[streaming.TopicPartition]int64{tp: cp.Offset}); err != nil {
+				return fmt.Errorf("advance broker offset to restored checkpoint for %s: %w", tp, err)
+			}
+			p.committed[tp] = cp.Offset
+			t.checkpointRevision = cp.Revision
+		}
+	}
 	p.tasks[tp] = t
 	p.queues.Store(tp, t.queue)
 
@@ -225,14 +259,15 @@ func (p *Processor) assign(tp streaming.TopicPartition) {
 	t.cancel = cancel
 	go t.run(ctx)
 	p.log.Debug("partition assigned", "tp", tp.String())
+	return nil
 }
 
 // revoke stops a task whose partition now belongs to someone else.
 //
 // We deliberately do NOT try to flush or commit: the broker has already
 // reassigned the partition, so a commit would be fenced (and would race the new
-// owner's progress). The new owner resumes from the last committed offset and
-// rebuilds the window state by replay — the design the safe-offset rule exists for.
+// owner's progress). The new owner restores the latest durable checkpoint; if
+// there is no checkpoint, it resumes from the safe broker offset and rebuilds.
 func (p *Processor) revoke(tp streaming.TopicPartition, t *partitionTask) {
 	t.cancel()
 	<-t.done

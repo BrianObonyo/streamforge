@@ -29,15 +29,19 @@ type partitionTask struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
-	permFails  int   // goroutine-local: consecutive permanent sink failures
-	next       int64 // goroutine-local: one past the last handled offset (-1 = none yet)
-	lastLate   aggregation.LateStats
-	lastLateAt time.Time
+	permFails          int   // goroutine-local: consecutive permanent sink failures
+	next               int64 // goroutine-local: one past the last handled offset (-1 = none yet)
+	lastLate           aggregation.LateStats
+	lastLateAt         time.Time
+	checkpointRevision uint64
+	lastCheckpointAt   time.Time
+	checkpointDirty    bool
 
 	// Published for other goroutines (commit loop, metrics scrape).
-	safe     atomic.Int64 // highest safely committable offset; -1 = unknown
-	open     atomic.Int64
-	consumed atomic.Int64
+	safe         atomic.Int64 // highest safely committable offset; -1 = unknown
+	open         atomic.Int64
+	consumed     atomic.Int64
+	resumeOffset atomic.Int64 // first offset not covered by a restored checkpoint
 }
 
 func newTask(p *Processor, tp streaming.TopicPartition) *partitionTask {
@@ -50,6 +54,7 @@ func newTask(p *Processor, tp streaming.TopicPartition) *partitionTask {
 		dedup: reliability.NewDeduper(p.cfg.DedupTTL, p.cfg.DedupMax),
 	}
 	t.safe.Store(-1)
+	t.resumeOffset.Store(-1)
 
 	// Backpressure wiring: at high-water, tell the BROKER to stop sending this
 	// partition (so records wait safely on disk, not in our heap) and tell AIMD
@@ -106,6 +111,7 @@ func (t *partitionTask) handle(ctx context.Context, rec streaming.Record) {
 	p := t.p
 	now := p.cfg.Now()
 	t.next = rec.Offset + 1
+	t.checkpointDirty = true
 	t.consumed.Store(t.next)
 	if !rec.Timestamp.IsZero() {
 		p.m.latency.Observe(now.Sub(rec.Timestamp).Seconds())
@@ -205,10 +211,15 @@ func (t *partitionTask) advance(ctx context.Context) {
 
 	t.agg.Ack(batch)
 	t.open.Store(int64(t.agg.OpenWindows()))
-	if t.next >= 0 {
+	t.flushLate(ctx, false)
+	if p.d.Checkpoints != nil {
+		if err := t.persistCheckpoint(ctx, now); err != nil {
+			p.m.checkpointErrors.Inc()
+			p.log.Warn("state checkpoint failed; holding offset commits", "tp", t.tp.String(), "err", err)
+		}
+	} else if t.next >= 0 {
 		t.safe.Store(t.agg.SafeOffset(t.next))
 	}
-	t.flushLate(ctx, false)
 }
 
 // handleSinkFailure classifies a failed sink write and returns true ONLY when the

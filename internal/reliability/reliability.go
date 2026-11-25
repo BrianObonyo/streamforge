@@ -52,6 +52,18 @@ type seenEntry struct {
 	at time.Time
 }
 
+// DeduperSnapshot is a serializable copy of the entries retained for replay
+// detection. Entries remain in age order so TTL and size eviction resume exactly.
+type DeduperSnapshot struct {
+	Entries []DeduperEntry
+}
+
+// DeduperEntry is one previously observed event ID and its observation time.
+type DeduperEntry struct {
+	ID string
+	At time.Time
+}
+
 // NewDeduper creates a Deduper. ttl<=0 disables time eviction; max<=0 disables
 // size eviction.
 func NewDeduper(ttl time.Duration, max int) *Deduper {
@@ -79,6 +91,40 @@ func (d *Deduper) Len() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.ll.Len()
+}
+
+// Snapshot returns the retained event IDs in eviction order.
+func (d *Deduper) Snapshot() DeduperSnapshot {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	s := DeduperSnapshot{Entries: make([]DeduperEntry, 0, d.ll.Len())}
+	for e := d.ll.Front(); e != nil; e = e.Next() {
+		entry := e.Value.(seenEntry)
+		s.Entries = append(s.Entries, DeduperEntry{ID: entry.id, At: entry.at})
+	}
+	return s
+}
+
+// Restore replaces retained IDs from a compatible snapshot.
+func (d *Deduper) Restore(s DeduperSnapshot) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.max > 0 && len(s.Entries) > d.max {
+		return fmt.Errorf("deduper: snapshot has %d entries, configured maximum is %d", len(s.Entries), d.max)
+	}
+	byID := make(map[string]*list.Element, len(s.Entries))
+	ll := list.New()
+	for _, entry := range s.Entries {
+		if entry.ID == "" || entry.At.IsZero() {
+			return fmt.Errorf("deduper: invalid entry in snapshot")
+		}
+		if _, exists := byID[entry.ID]; exists {
+			return fmt.Errorf("deduper: duplicate ID in snapshot")
+		}
+		byID[entry.ID] = ll.PushBack(seenEntry{id: entry.ID, at: entry.At})
+	}
+	d.ll, d.byID = ll, byID
+	return nil
 }
 
 func (d *Deduper) evictLocked(now time.Time) {

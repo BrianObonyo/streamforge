@@ -64,8 +64,9 @@ type Config struct {
 	IdleTimeout     time.Duration // processing-time watermark fallback; 0 disables
 	Assigner        aggregation.Assigner
 
-	TickInterval   time.Duration // how often a task collects & emits due windows
-	CommitInterval time.Duration // how often safe offsets are committed
+	TickInterval       time.Duration // how often a task collects & emits due windows
+	CommitInterval     time.Duration // how often safe offsets are committed
+	CheckpointInterval time.Duration // max interval between idle-state checkpoints
 
 	DedupTTL time.Duration
 	DedupMax int
@@ -117,6 +118,7 @@ func (c *Config) ApplyDefaults() error {
 	def(&c.AllowedLateness, 5*time.Second)
 	def(&c.TickInterval, 250*time.Millisecond)
 	def(&c.CommitInterval, 500*time.Millisecond)
+	def(&c.CheckpointInterval, 5*time.Second)
 	def(&c.DedupTTL, 10*time.Minute)
 	defInt(&c.DedupMax, 1_000_000)
 	if c.Retry.MaxAttempts == 0 {
@@ -127,6 +129,9 @@ func (c *Config) ApplyDefaults() error {
 	def(&c.BreakerOpenFor, 2*time.Second)
 	if c.Now == nil {
 		c.Now = time.Now
+	}
+	if c.CheckpointInterval < 0 {
+		return fmt.Errorf("processor: checkpoint interval must be >= 0")
 	}
 	if c.HighWater > c.QueueCapacity || c.LowWater >= c.HighWater {
 		return fmt.Errorf("processor: need low-water < high-water <= queue capacity (got %d/%d/%d)",
@@ -152,6 +157,7 @@ func RegisterFlags(fs *flag.FlagSet, c *Config) {
 	fs.DurationVar(&c.MaxOutOfOrder, "max-ooo", 2*time.Second, "watermark slack for out-of-order events")
 	fs.DurationVar(&c.AllowedLateness, "lateness", 5*time.Second, "how long fired windows still accept late events")
 	fs.DurationVar(&c.IdleTimeout, "idle", 3*time.Second, "advance watermark by wall clock after this much idle time (0 = off)")
+	fs.DurationVar(&c.CheckpointInterval, "checkpoint-interval", 5*time.Second, "maximum interval between idle-state checkpoints")
 	fs.IntVar(&c.QueueCapacity, "queue", 4096, "per-partition queue capacity")
 	fs.Float64Var(&c.ThrottleCeiling, "throttle", 0, "AIMD ceiling in events/sec (0 = off)")
 	fs.DurationVar(&c.DedupTTL, "dedup-ttl", 10*time.Minute, "how long event IDs are remembered")

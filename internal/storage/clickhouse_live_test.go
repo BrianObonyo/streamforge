@@ -44,6 +44,31 @@ func TestLiveSchemaIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestLiveCheckpointRoundTrip(t *testing.T) {
+	ch, done := liveCH(t)
+	defer done()
+	ctx := context.Background()
+	checkpoint := Checkpoint{
+		Group: "live-checkpoint", Topic: "events", Partition: 2,
+		Offset: 17, Revision: 1, Config: "test-config", State: []byte(`{"next_offset":17}`),
+	}
+	if err := ch.SaveCheckpoint(ctx, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint.Offset, checkpoint.Revision, checkpoint.State = 23, 2, []byte(`{"next_offset":23}`)
+	if err := ch.SaveCheckpoint(ctx, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := ch.LoadCheckpoint(ctx, checkpoint.Group, checkpoint.Topic, checkpoint.Partition)
+	if err != nil || !ok {
+		t.Fatalf("load checkpoint: found=%v err=%v", ok, err)
+	}
+	if got.Offset != checkpoint.Offset || got.Revision != checkpoint.Revision ||
+		string(got.State) != string(checkpoint.State) {
+		t.Fatalf("latest checkpoint = %+v, want %+v", got, checkpoint)
+	}
+}
+
 // The central correctness claim of ADR-0002, checked against the real engine:
 // before any background merge, three versions of one window coexist on disk, yet
 // a FINAL read must return only the fullest one.

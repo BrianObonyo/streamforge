@@ -1,6 +1,8 @@
 package aggregation
 
 import (
+	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -119,6 +121,30 @@ type Aggregator struct {
 	late    LateStats
 }
 
+// WindowSnapshot is a serializable copy of one retained event-time window.
+type WindowSnapshot struct {
+	Window    Window
+	Groups    []GroupSnapshot
+	MinOffset int64
+	Fired     bool
+	Dirty     bool
+}
+
+// GroupSnapshot stores one aggregate dimension in a window.
+type GroupSnapshot struct {
+	Kind  events.Kind
+	Key   string
+	Stats Stats
+}
+
+// Snapshot is the complete durable state of one partition aggregator.
+type Snapshot struct {
+	Version   int
+	Watermark WatermarkSnapshot
+	Windows   []WindowSnapshot
+	Late      LateStats
+}
+
 // New creates an aggregator.
 func New(cfg Config) *Aggregator {
 	return &Aggregator{
@@ -126,6 +152,77 @@ func New(cfg Config) *Aggregator {
 		wm:      NewWatermark(cfg.MaxOutOfOrder, cfg.IdleTimeout),
 		windows: map[int64]*windowState{},
 	}
+}
+
+// Snapshot returns a deterministic, serializable copy of the aggregator state.
+func (a *Aggregator) Snapshot() Snapshot {
+	s := Snapshot{Version: 1, Watermark: a.wm.Snapshot(), Late: a.late}
+	for _, ws := range a.windows {
+		w := WindowSnapshot{Window: ws.w, MinOffset: ws.minOffset, Fired: ws.fired, Dirty: ws.dirty}
+		for key, stats := range ws.groups {
+			w.Groups = append(w.Groups, GroupSnapshot{Kind: key.Kind, Key: key.Key, Stats: *stats})
+		}
+		sort.Slice(w.Groups, func(i, j int) bool {
+			if w.Groups[i].Kind != w.Groups[j].Kind {
+				return w.Groups[i].Kind < w.Groups[j].Kind
+			}
+			return w.Groups[i].Key < w.Groups[j].Key
+		})
+		s.Windows = append(s.Windows, w)
+	}
+	sort.Slice(s.Windows, func(i, j int) bool {
+		return s.Windows[i].Window.Start.Before(s.Windows[j].Window.Start)
+	})
+	return s
+}
+
+// Restore replaces the aggregator state from a compatible snapshot.
+func (a *Aggregator) Restore(s Snapshot) error {
+	if s.Version != 1 {
+		return fmt.Errorf("aggregation: unsupported snapshot version %d", s.Version)
+	}
+	if s.Late.OnTime < 0 || s.Late.Late < 0 || s.Late.TooLate < 0 || s.Late.MaxLateness < 0 {
+		return fmt.Errorf("aggregation: invalid late statistics in snapshot")
+	}
+	wm := NewWatermark(a.cfg.MaxOutOfOrder, a.cfg.IdleTimeout)
+	if err := wm.Restore(s.Watermark); err != nil {
+		return err
+	}
+	windows := make(map[int64]*windowState, len(s.Windows))
+	for _, saved := range s.Windows {
+		if saved.Window.Start.IsZero() || !saved.Window.End.After(saved.Window.Start) {
+			return fmt.Errorf("aggregation: invalid window in snapshot")
+		}
+		start := saved.Window.Start.UnixNano()
+		if _, exists := windows[start]; exists {
+			return fmt.Errorf("aggregation: duplicate window in snapshot")
+		}
+		if len(saved.Groups) == 0 {
+			return fmt.Errorf("aggregation: empty window in snapshot")
+		}
+		ws := &windowState{
+			w: saved.Window, groups: make(map[GroupKey]*Stats, len(saved.Groups)),
+			minOffset: saved.MinOffset, fired: saved.Fired, dirty: saved.Dirty,
+		}
+		for _, group := range saved.Groups {
+			if !group.Kind.Valid() || group.Key == "" || group.Stats.Count <= 0 ||
+				math.IsNaN(group.Stats.Sum) || math.IsInf(group.Stats.Sum, 0) ||
+				math.IsNaN(group.Stats.Min) || math.IsInf(group.Stats.Min, 0) ||
+				math.IsNaN(group.Stats.Max) || math.IsInf(group.Stats.Max, 0) ||
+				group.Stats.Min > group.Stats.Max {
+				return fmt.Errorf("aggregation: invalid group in snapshot")
+			}
+			key := GroupKey{Kind: group.Kind, Key: group.Key}
+			if _, exists := ws.groups[key]; exists {
+				return fmt.Errorf("aggregation: duplicate group in snapshot")
+			}
+			stats := group.Stats
+			ws.groups[key] = &stats
+		}
+		windows[start] = ws
+	}
+	a.wm, a.windows, a.late = wm, windows, s.Late
+	return nil
 }
 
 // Add folds an event (read from broker `offset`) into its window(s).

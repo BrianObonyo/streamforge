@@ -32,7 +32,7 @@ type member struct {
 }
 
 func startMember(t *testing.T, b streaming.Broker, id string, sink storage.Sink, dlq reliability.DLQ,
-	reg *metrics.Registry, mod func(*processor.Config)) *member {
+	reg *metrics.Registry, mod func(*processor.Config), checkpoints ...storage.CheckpointStore) *member {
 	t.Helper()
 	c, err := b.NewConsumer("g", id, topic)
 	if err != nil {
@@ -48,7 +48,13 @@ func startMember(t *testing.T, b streaming.Broker, id string, sink storage.Sink,
 	if mod != nil {
 		mod(&cfg)
 	}
-	p, err := processor.New(cfg, processor.Deps{Consumer: c, Sink: sink, DLQ: dlq, Metrics: reg})
+	var checkpointStore storage.CheckpointStore
+	if len(checkpoints) > 0 {
+		checkpointStore = checkpoints[0]
+	}
+	p, err := processor.New(cfg, processor.Deps{
+		Consumer: c, Sink: sink, Checkpoints: checkpointStore, DLQ: dlq, Metrics: reg,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,6 +180,71 @@ func TestExactAggregatesUnderChaos(t *testing.T) {
 		t.Errorf("fault injection never reached B: %+v", st)
 	}
 	t.Logf("unique=%d poison=%d dupDropsB=%d lateB=%d", unique, poison, bm.proc.Stats().Duplicates, bm.proc.Stats().Late)
+}
+
+func TestCheckpointRestoreAfterCrashBeforeBrokerCommit(t *testing.T) {
+	b, pub := setup(t, 3)
+	store := storage.NewMemStore()
+	configure := func(c *processor.Config) {
+		c.CommitInterval = time.Hour
+		c.CheckpointInterval = 10 * time.Millisecond
+		c.MaxOutOfOrder, c.AllowedLateness, c.IdleTimeout = 1500*time.Millisecond, 5*time.Second, 500*time.Millisecond
+	}
+	first := startMember(t, b, "first", store, nil, nil, configure, store)
+	g := ingestion.NewGenerator(ingestion.GenConfig{Seed: 20261125, DisorderProb: 0.2, MaxDelay: time.Second, DupProb: 0.05})
+	initial, _ := produce(t, g, pub, 700)
+
+	eventually(t, 15*time.Second, "checkpoint to cover every partition log", func() (bool, string) {
+		ends := b.EndOffsets(topic)
+		var details strings.Builder
+		for partition, end := range ends {
+			cp, ok, err := store.LoadCheckpoint(context.Background(), "g", topic, partition)
+			if err != nil {
+				return false, err.Error()
+			}
+			if !ok || cp.Offset != end {
+				fmt.Fprintf(&details, " partition=%d checkpoint=%+v end=%d;", partition, cp, end)
+				return false, details.String()
+			}
+		}
+		return true, ""
+	})
+	if committed := b.Committed("g"); len(committed) != 0 {
+		t.Fatalf("test expected a crash before broker commit, got commits: %v", committed)
+	}
+
+	if err := first.consumer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-first.done:
+		if !errors.Is(err, streaming.ErrClosed) {
+			t.Fatalf("crashed member returned %v, want ErrClosed", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("crashed member did not stop")
+	}
+
+	second := startMember(t, b, "second", store, nil, nil, configure, store)
+	eventually(t, 5*time.Second, "restored checkpoint offsets to be committed", func() (bool, string) {
+		for partition, end := range b.EndOffsets(topic) {
+			tp := streaming.TopicPartition{Topic: topic, Partition: partition}
+			if got := b.Committed("g")[tp]; got != end {
+				return false, fmt.Sprintf("partition %d committed=%d checkpoint=%d", partition, got, end)
+			}
+		}
+		return true, ""
+	})
+
+	more, _ := produce(t, g, pub, 500)
+	want := int64(initial + more)
+	eventually(t, 20*time.Second, "restored and new events to be stored exactly once", func() (bool, string) {
+		got := totalCount(store)
+		return got == want, fmt.Sprintf("stored=%d want=%d", got, want)
+	})
+	if err := second.consumer.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func sumLag(m map[streaming.TopicPartition]int64) (n int64) {

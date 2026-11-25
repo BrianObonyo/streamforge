@@ -19,13 +19,14 @@ import (
 
 // CHConfig configures the ClickHouse store.
 type CHConfig struct {
-	URL      string // e.g. http://localhost:8123
-	Database string // default "streamforge"
-	Table    string // results table, default "window_results"
-	LateTbl  string // late-stats table, default "late_stats"
-	User     string
-	Password string
-	Timeout  time.Duration
+	URL           string // e.g. http://localhost:8123
+	Database      string // default "streamforge"
+	Table         string // results table, default "window_results"
+	LateTbl       string // late-stats table, default "late_stats"
+	CheckpointTbl string // processor checkpoints table, default "processor_checkpoints"
+	User          string
+	Password      string
+	Timeout       time.Duration
 }
 
 // ClickHouse implements Store over ClickHouse's HTTP interface
@@ -54,13 +55,16 @@ func NewClickHouse(cfg CHConfig) (*ClickHouse, error) {
 	if cfg.LateTbl == "" {
 		cfg.LateTbl = "late_stats"
 	}
+	if cfg.CheckpointTbl == "" {
+		cfg.CheckpointTbl = "processor_checkpoints"
+	}
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 10 * time.Second
 	}
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("clickhouse: URL is required")
 	}
-	for _, id := range []string{cfg.Database, cfg.Table, cfg.LateTbl} {
+	for _, id := range []string{cfg.Database, cfg.Table, cfg.LateTbl, cfg.CheckpointTbl} {
 		if !identRe.MatchString(id) {
 			return nil, fmt.Errorf("clickhouse: %q is not a safe identifier", id)
 		}
@@ -120,7 +124,7 @@ func (c *ClickHouse) do(ctx context.Context, query string, params map[string]str
 // NOTE: merges are ASYNCHRONOUS. Until one runs, duplicates coexist on disk, so
 // every read below uses FINAL to collapse them at query time.
 func (c *ClickHouse) EnsureSchema(ctx context.Context) error {
-	db, tbl, late := c.cfg.Database, c.cfg.Table, c.cfg.LateTbl
+	db, tbl, late, checkpoints := c.cfg.Database, c.cfg.Table, c.cfg.LateTbl, c.cfg.CheckpointTbl
 	stmts := []string{
 		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", db),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.%s (
@@ -148,6 +152,16 @@ func (c *ClickHouse) EnsureSchema(ctx context.Context) error {
 		PARTITION BY toYYYYMMDD(ts)
 		ORDER BY ts
 		TTL toDateTime(ts) + INTERVAL 30 DAY`, db, late),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.%s (
+			consumer_group   String,
+			topic            String,
+			partition        UInt32,
+			checkpoint_offset UInt64,
+			revision         UInt64,
+			config           String,
+			state            String
+		) ENGINE = ReplacingMergeTree(revision)
+		ORDER BY (consumer_group, topic, partition)`, db, checkpoints),
 	}
 	for _, s := range stmts {
 		if _, err := c.do(ctx, "", nil, strings.NewReader(s)); err != nil {
@@ -155,6 +169,63 @@ func (c *ClickHouse) EnsureSchema(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// LoadCheckpoint retrieves the highest durable revision for one partition.
+func (c *ClickHouse) LoadCheckpoint(ctx context.Context, group, topic string, partition int) (Checkpoint, bool, error) {
+	query := fmt.Sprintf(`SELECT consumer_group, topic, partition, checkpoint_offset,
+		revision, config, state FROM %s.%s FINAL
+		WHERE consumer_group = {group:String} AND topic = {topic:String} AND partition = {partition:UInt32}
+		ORDER BY revision DESC LIMIT 1 FORMAT JSONEachRow`, c.cfg.Database, c.cfg.CheckpointTbl)
+	b, err := c.do(ctx, "", map[string]string{
+		"group": group, "topic": topic, "partition": fmt.Sprint(partition),
+	}, strings.NewReader(query))
+	if err != nil {
+		return Checkpoint{}, false, err
+	}
+	type checkpointRow struct {
+		Group     string `json:"consumer_group"`
+		Topic     string `json:"topic"`
+		Partition int    `json:"partition"`
+		Offset    int64  `json:"checkpoint_offset"`
+		Revision  uint64 `json:"revision"`
+		Config    string `json:"config"`
+		State     string `json:"state"`
+	}
+	rows, err := rowsOf[checkpointRow](b)
+	if err != nil {
+		return Checkpoint{}, false, err
+	}
+	if len(rows) == 0 {
+		return Checkpoint{}, false, nil
+	}
+	row := rows[0]
+	cp := Checkpoint{
+		Group: row.Group, Topic: row.Topic, Partition: row.Partition, Offset: row.Offset,
+		Revision: row.Revision, Config: row.Config, State: []byte(row.State),
+	}
+	if err := validateCheckpoint(cp); err != nil {
+		return Checkpoint{}, false, err
+	}
+	return cp, true, nil
+}
+
+// SaveCheckpoint appends a versioned snapshot. Reads use FINAL so the highest
+// revision is visible before background merges complete.
+func (c *ClickHouse) SaveCheckpoint(ctx context.Context, cp Checkpoint) error {
+	if err := validateCheckpoint(cp); err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(map[string]any{
+		"consumer_group": cp.Group, "topic": cp.Topic, "partition": cp.Partition,
+		"checkpoint_offset": cp.Offset, "revision": cp.Revision,
+		"config": cp.Config, "state": string(cp.State),
+	}); err != nil {
+		return err
+	}
+	query := fmt.Sprintf("INSERT INTO %s.%s FORMAT JSONEachRow", c.cfg.Database, c.cfg.CheckpointTbl)
+	return c.insert(ctx, query, buf.Bytes())
 }
 
 const chTime = "2006-01-02 15:04:05.000"

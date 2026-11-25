@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -18,15 +19,27 @@ type rowKey struct {
 
 // MemStore is a thread-safe in-memory Store.
 type MemStore struct {
-	mu   sync.RWMutex
-	rows map[rowKey]aggregation.Result
-	late []LateStatRow
+	mu          sync.RWMutex
+	rows        map[rowKey]aggregation.Result
+	late        []LateStatRow
+	checkpoints map[checkpointKey]Checkpoint
 
 	failNext int // test hook: fail this many upcoming WriteResults calls
 }
 
+type checkpointKey struct {
+	group     string
+	topic     string
+	partition int
+}
+
 // NewMemStore returns an empty store.
-func NewMemStore() *MemStore { return &MemStore{rows: map[rowKey]aggregation.Result{}} }
+func NewMemStore() *MemStore {
+	return &MemStore{
+		rows:        map[rowKey]aggregation.Result{},
+		checkpoints: map[checkpointKey]Checkpoint{},
+	}
+}
 
 // FailNext makes the next n WriteResults calls fail (simulating a sink outage).
 func (m *MemStore) FailNext(n int) {
@@ -58,6 +71,41 @@ func (m *MemStore) WriteLateStats(_ context.Context, rows []LateStatRow) error {
 	m.mu.Lock()
 	m.late = append(m.late, rows...)
 	m.mu.Unlock()
+	return nil
+}
+
+// LoadCheckpoint returns a copy of the latest checkpoint for a partition.
+func (m *MemStore) LoadCheckpoint(ctx context.Context, group, topic string, partition int) (Checkpoint, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return Checkpoint{}, false, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cp, ok := m.checkpoints[checkpointKey{group: group, topic: topic, partition: partition}]
+	cp.State = append([]byte(nil), cp.State...)
+	return cp, ok, nil
+}
+
+// SaveCheckpoint stores a newer checkpoint, preserving the highest revision.
+func (m *MemStore) SaveCheckpoint(ctx context.Context, cp Checkpoint) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validateCheckpoint(cp); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := checkpointKey{group: cp.Group, topic: cp.Topic, partition: cp.Partition}
+	old, ok := m.checkpoints[key]
+	if ok && cp.Revision < old.Revision {
+		return fmt.Errorf("checkpoint: revision %d is older than stored revision %d", cp.Revision, old.Revision)
+	}
+	if ok && cp.Revision == old.Revision && (cp.Offset != old.Offset || cp.Config != old.Config || string(cp.State) != string(old.State)) {
+		return fmt.Errorf("checkpoint: conflicting data at revision %d", cp.Revision)
+	}
+	cp.State = append([]byte(nil), cp.State...)
+	m.checkpoints[key] = cp
 	return nil
 }
 

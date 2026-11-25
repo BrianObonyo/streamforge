@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -68,6 +69,38 @@ func TestMemStoreFailNext(t *testing.T) {
 	}
 }
 
+func TestMemStoreCheckpointKeepsHighestRevision(t *testing.T) {
+	s := NewMemStore()
+	ctx := context.Background()
+	first := Checkpoint{
+		Group: "group", Topic: "events", Partition: 2, Offset: 14,
+		Revision: 1, Config: "cfg", State: []byte(`{"next_offset":14}`),
+	}
+	if err := s.SaveCheckpoint(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	newer := first
+	newer.Offset, newer.Revision, newer.State = 20, 2, []byte(`{"next_offset":20}`)
+	if err := s.SaveCheckpoint(ctx, newer); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveCheckpoint(ctx, first); err == nil {
+		t.Fatal("older checkpoint revision was accepted")
+	}
+	got, ok, err := s.LoadCheckpoint(ctx, "group", "events", 2)
+	if err != nil || !ok {
+		t.Fatalf("load checkpoint: found=%v err=%v", ok, err)
+	}
+	if got.Offset != 20 || got.Revision != 2 || string(got.State) != string(newer.State) {
+		t.Fatalf("loaded stale checkpoint: %+v", got)
+	}
+	got.State[0] = 'x'
+	again, _, err := s.LoadCheckpoint(ctx, "group", "events", 2)
+	if err != nil || string(again.State) != string(newer.State) {
+		t.Fatalf("checkpoint state was not copied on load: %+v err=%v", again, err)
+	}
+}
+
 func TestMemStoreLateSummary(t *testing.T) {
 	s := NewMemStore()
 	_ = s.WriteLateStats(context.Background(), []LateStatRow{
@@ -121,6 +154,78 @@ func TestClickHouseInsertWireFormat(t *testing.T) {
 
 // Security property: client-supplied values must travel as query PARAMETERS and
 // never appear inside the SQL text.
+func TestClickHouseSchemaIncludesCheckpointTable(t *testing.T) {
+	var statements []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		statements = append(statements, string(body))
+	}))
+	defer srv.Close()
+	ch, err := NewClickHouse(CHConfig{URL: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ch.EnsureSchema(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, statement := range statements {
+		if strings.Contains(statement, "processor_checkpoints") &&
+			strings.Contains(statement, "ReplacingMergeTree(revision)") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("checkpoint table DDL missing: %v", statements)
+	}
+}
+
+func TestClickHouseCheckpointReadWrite(t *testing.T) {
+	var insertBody, selectSQL string
+	var selectParams map[string][]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if query := r.URL.Query().Get("query"); strings.HasPrefix(query, "INSERT") {
+			body, _ := io.ReadAll(r.Body)
+			insertBody = string(body)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		selectSQL, selectParams = string(body), r.URL.Query()
+		_, _ = io.WriteString(w, `{"consumer_group":"processors","topic":"events","partition":2,"checkpoint_offset":17,"revision":3,"config":"fingerprint","state":"{\"next_offset\":17}"}`+"\n")
+	}))
+	defer srv.Close()
+	ch, err := NewClickHouse(CHConfig{URL: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := Checkpoint{
+		Group: "processors", Topic: "events", Partition: 2, Offset: 17,
+		Revision: 3, Config: "fingerprint", State: []byte(`{"next_offset":17}`),
+	}
+	if err := ch.SaveCheckpoint(context.Background(), cp); err != nil {
+		t.Fatal(err)
+	}
+	var inserted map[string]any
+	if err := json.Unmarshal([]byte(insertBody), &inserted); err != nil {
+		t.Fatalf("invalid checkpoint INSERT body %q: %v", insertBody, err)
+	}
+	if inserted["consumer_group"] != cp.Group || inserted["state"] != string(cp.State) {
+		t.Fatalf("unexpected checkpoint INSERT: %+v", inserted)
+	}
+	got, ok, err := ch.LoadCheckpoint(context.Background(), cp.Group, cp.Topic, cp.Partition)
+	if err != nil || !ok {
+		t.Fatalf("load checkpoint: found=%v err=%v", ok, err)
+	}
+	if got.Offset != cp.Offset || got.Revision != cp.Revision || string(got.State) != string(cp.State) {
+		t.Fatalf("loaded checkpoint differs: %+v", got)
+	}
+	if !strings.Contains(selectSQL, "FINAL") || selectParams["param_group"][0] != cp.Group ||
+		selectParams["param_topic"][0] != cp.Topic ||
+		selectParams["param_partition"][0] != "2" {
+		t.Fatalf("checkpoint keys were not parameterized: %+v", selectParams)
+	}
+}
+
 func TestClickHouseQueriesAreParameterised(t *testing.T) {
 	var sql string
 	var params map[string][]string

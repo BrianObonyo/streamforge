@@ -1,6 +1,7 @@
 package aggregation
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -136,6 +137,37 @@ func TestSafeOffsetHeldByOpenWindows(t *testing.T) {
 	a.Ack(a.Collect(t0, 0)) // emits + GCs [0,10) (no lateness)
 	if got := a.SafeOffset(102); got != 101 {
 		t.Fatalf("safe=%d, want 101", got)
+	}
+}
+
+func TestAggregatorSnapshotRestoresPendingLateRefinement(t *testing.T) {
+	a := newAgg(0, 5*time.Second)
+	a.Add(ev("first", time.Second, 2), 10, t0)
+	a.Add(ev("advance", 11*time.Second, 1), 11, t0)
+	a.Ack(a.Collect(t0, 0))
+	if got := a.Add(ev("late", 2*time.Second, 3), 12, t0); got != Late {
+		t.Fatalf("late event outcome = %v, want Late", got)
+	}
+
+	data, err := json.Marshal(a.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot Snapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	restored := newAgg(0, 5*time.Second)
+	if err := restored.Restore(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	batch := restored.Collect(t0, 0)
+	if len(batch.Results) != 1 || !batch.Results[0].Update ||
+		batch.Results[0].Stats.Count != 2 || batch.Results[0].Version != 2 {
+		t.Fatalf("restored pending refinement = %+v", batch.Results)
+	}
+	if got := restored.SafeOffset(13); got != 10 {
+		t.Fatalf("restored safe offset = %d, want 10", got)
 	}
 }
 

@@ -40,6 +40,23 @@ func TestDeduperSizeBound(t *testing.T) {
 	}
 }
 
+func TestDeduperSnapshotRestoresAgeAndOrder(t *testing.T) {
+	d := NewDeduper(10*time.Second, 3)
+	d.Seen("old", t0)
+	d.Seen("new", t0.Add(time.Second))
+	snapshot := d.Snapshot()
+	restored := NewDeduper(10*time.Second, 3)
+	if err := restored.Restore(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if !restored.Seen("new", t0.Add(2*time.Second)) {
+		t.Fatal("restored recent ID was not recognized")
+	}
+	if restored.Seen("old", t0.Add(11*time.Second)) {
+		t.Fatal("restored entry did not retain its original TTL age")
+	}
+}
+
 func TestRetryBackoffBounds(t *testing.T) {
 	p := RetryPolicy{Base: 10 * time.Millisecond, Max: 80 * time.Millisecond}
 	for attempt := 0; attempt < 40; attempt++ { // 40 also exercises shift-overflow clamping

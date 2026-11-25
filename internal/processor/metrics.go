@@ -11,13 +11,14 @@ type pm struct {
 
 	onTime, late, tooLate, duplicate, invalid, poison *metrics.Counter
 
-	emitted, emittedUpdates   *metrics.Counter
-	sinkErrors, sinkPermanent *metrics.Counter
-	sinkDeadLettered          *metrics.Counter
-	pollErrors                *metrics.Counter
-	commits, commitErrors     *metrics.Counter
-	rebalances                *metrics.Counter
-	dlqSent, dlqErrors        *metrics.Counter
+	emitted, emittedUpdates       *metrics.Counter
+	sinkErrors, sinkPermanent     *metrics.Counter
+	sinkDeadLettered              *metrics.Counter
+	pollErrors                    *metrics.Counter
+	commits, commitErrors         *metrics.Counter
+	checkpoints, checkpointErrors *metrics.Counter
+	rebalances                    *metrics.Counter
+	dlqSent, dlqErrors            *metrics.Counter
 
 	latency     *metrics.Histogram // broker append → processed
 	sinkLatency *metrics.Histogram
@@ -46,6 +47,8 @@ func newMetrics(reg *metrics.Registry) *pm {
 		pollErrors:       reg.Counter("sf_poll_errors_total", "Broker poll failures (retried with backoff).", nil),
 		commits:          reg.Counter("sf_offset_commits_total", "Successful offset commits.", nil),
 		commitErrors:     reg.Counter("sf_offset_commit_errors_total", "Failed offset commits.", nil),
+		checkpoints:      reg.Counter("sf_state_checkpoints_total", "Successful durable processor state checkpoints.", nil),
+		checkpointErrors: reg.Counter("sf_state_checkpoint_errors_total", "Failed durable processor state checkpoints.", nil),
 		rebalances:       reg.Counter("sf_rebalances_total", "Partition assignment changes observed.", nil),
 		dlqSent:          reg.Counter("sf_dlq_messages_total", "Messages sent to the dead-letter queue.", nil),
 		dlqErrors:        reg.Counter("sf_dlq_errors_total", "Dead-letter sends that failed.", nil),

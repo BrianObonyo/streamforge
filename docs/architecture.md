@@ -17,9 +17,9 @@
         │  pause/resume at high/low water                      ▼                          │
         │                                      Collect ─▶ Sink(retry+breaker) ─▶ Ack      │
         └────────────────────────────────────────────────────────────────────────────────┘
-                     │ safe offsets                              │ rows (idempotent upsert)
-                     ▼                                           ▼
-              commit to broker                         ClickHouse (ReplacingMergeTree)
+                     │ checkpoint then commit                     │ rows (idempotent upsert)
+                     ▼                                            ▼
+             broker offsets ◀────────────────────────── ClickHouse (state + results)
                                                                  │
                                                      Analytics API ─▶ Grafana / clients
 ```
@@ -34,8 +34,8 @@
 | `backpressure` | bounded queue with hysteresis, token bucket, AIMD controller |
 | `aggregation` | window assigners, watermark, aggregator, two-phase emit, safe offset |
 | `reliability` | dedup, jittered retry, circuit breaker, DLQ |
-| `storage` | `Store` interface; `MemStore`; ClickHouse over HTTP |
-| `processor` | the engine: rebalance handling, tasks, commits, shutdown |
+| `storage` | `Store` and `CheckpointStore` interfaces; `MemStore`; ClickHouse over HTTP |
+| `processor` | the engine: rebalance handling, tasks, durable checkpoints, commits, shutdown |
 | `ingestion` | workload generator, publisher, HTTP ingestion API |
 | `api` | analytics HTTP API, health, `/metrics` |
 | `metrics` | dependency-free Prometheus registry |
@@ -57,12 +57,15 @@ paused **at the broker** (records wait on disk, not in the heap); at the
 additionally shrinks the consume rate on congestion and probes upward when healthy.
 External HTTP clients get `429 + Retry-After`. *(Chiu & Jain, 1989.)*
 
-### 3.3 Crashes → commit only what is safe to forget
-Delivery is at-least-once. The subtlety: a record can't be forgotten while any
-window it contributed to is still in memory, because a crash would lose that
-window. So each partition commits `min(next, lowest offset held by any retained
-window)` — the **safe offset**. After a crash the new owner resumes there and
-rebuilds exactly the state that was lost.
+### 3.3 Crashes → persist state before advancing offsets
+Delivery is at-least-once. Without a checkpoint store, each partition commits
+`min(next, lowest offset held by any retained window)` — the **safe offset** —
+so a restart can rebuild open state from the broker log. The production processor
+uses the configured checkpoint-capable store: it saves the full partition state
+(windows, watermark, dedup IDs, and next offset) before committing that next
+offset. On reassignment it restores the snapshot, advances the broker offset, and
+continues without rebuilding the saved state. Checkpoint failures hold back
+offset commits. Details and limits: [`checkpoints.md`](checkpoints.md).
 
 ### 3.4 Replays → idempotent sinks
 Replay, retry and late refinement all re-emit rows. Each row carries
@@ -86,7 +89,8 @@ exactly this reason.
 * Cross-goroutine state is limited to atomics (`safe`, `open`, `consumed`), the
   queue (a channel), the shared circuit breaker, and the metrics registry.
 * Revocation cancels a task without flushing or committing: the broker has already
-  reassigned the partition and a commit would be fenced.
+  reassigned the partition and a commit would be fenced. The successor restores the
+  latest durable checkpoint and commits its offset before processing.
 
 ## 5. Delivery guarantees (precisely)
 
@@ -125,7 +129,8 @@ are kept in memory and retried — nothing is dropped.
 | Publish transient | `Do` retry | jittered backoff; batch retry may duplicate (dedup covers it) | `sf_ingest_retries_total` |
 | Publish permanent (unknown topic) | `ErrUnknownTopic` | fail fast, no retry | `sf_ingest_failed_total` |
 | Commit fenced (rebalance race) | `ErrNotAssigned` | ignored; next loop reconciles | — |
-| Processor killed (-9) | broker session timeout | partitions reassigned; replay from safe offset; version rule keeps results exact | `sf_rebalances_total` |
+| Processor killed (-9) | broker session timeout | successor restores checkpoint and resumes at its offset; without a checkpoint, replay starts at the safe offset | `sf_rebalances_total`, `sf_state_checkpoints_total` |
+| Checkpoint write fails | checkpoint store error | hold back new offset commits; retry checkpoint on a later task tick | `sf_state_checkpoint_errors_total` |
 | Overload | queue high-water | pause partition at broker; AIMD shrinks rate | `sf_paused_partitions`, `sf_throttle_rate` |
 | Telemetry backend down | exporter | spans dropped, **never blocks pipeline** | tracer `Dropped`/`ExportErrors` |
 
@@ -146,6 +151,8 @@ Rationale and trade-offs: ADR-0007.
 * `tests/integration`: chaos run — disorder + duplicates + garbage + sink outage +
   **hard-killed group member** — then asserts stored totals equal unique events
   exactly. Also asserts backpressure engages and graceful shutdown commits to log end.
+* Checkpoint integration kills a processor after its state snapshot but before its
+  broker offset commit, then verifies restore and exact counts.
 * `cmd/demo` repeats that proof interactively.
 * ClickHouse code is tested twice: against an `httptest` stub (wire format,
   parameterisation) and, when `SF_TEST_CLICKHOUSE_URL` is set, against a **real

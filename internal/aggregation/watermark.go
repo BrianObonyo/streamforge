@@ -1,6 +1,9 @@
 package aggregation
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Watermark tracks "how far has event time progressed?" for ONE partition.
 //
@@ -33,6 +36,14 @@ type Watermark struct {
 	seen     bool
 }
 
+// WatermarkSnapshot is the durable state needed to resume watermark progress.
+type WatermarkSnapshot struct {
+	MaxEvent time.Time
+	LastSeen time.Time
+	Current  time.Time
+	Seen     bool
+}
+
 // NewWatermark creates a tracker. idle == 0 disables the processing-time fallback.
 func NewWatermark(maxOutOfOrder, idle time.Duration) *Watermark {
 	return &Watermark{maxOOO: maxOutOfOrder, idle: idle}
@@ -63,4 +74,23 @@ func (w *Watermark) Current(now time.Time) time.Time {
 		w.current = c // monotone: never regress
 	}
 	return w.current
+}
+
+// Snapshot returns the event-time progress without exposing configuration.
+func (w *Watermark) Snapshot() WatermarkSnapshot {
+	return WatermarkSnapshot{
+		MaxEvent: w.maxEvent, LastSeen: w.lastSeen, Current: w.current, Seen: w.seen,
+	}
+}
+
+// Restore replaces the tracked event-time progress.
+func (w *Watermark) Restore(s WatermarkSnapshot) error {
+	if !s.Seen && (!s.MaxEvent.IsZero() || !s.LastSeen.IsZero() || !s.Current.IsZero()) {
+		return fmt.Errorf("watermark: unseen snapshot contains timestamps")
+	}
+	if s.Seen && (s.MaxEvent.IsZero() || s.LastSeen.IsZero()) {
+		return fmt.Errorf("watermark: seen snapshot is missing timestamps")
+	}
+	w.maxEvent, w.lastSeen, w.current, w.seen = s.MaxEvent, s.LastSeen, s.Current, s.Seen
+	return nil
 }

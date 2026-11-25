@@ -70,6 +70,10 @@ func main() {
 
 	store, err := storage.Open(ctx, *storeKind, storage.CHConfig{URL: *chURL, Database: *chDB, User: *chUser, Password: *chPass})
 	die(err)
+	checkpoints, ok := store.(storage.CheckpointStore)
+	if !ok {
+		die(errors.New("configured store does not support processor checkpoints"))
+	}
 
 	dlqProd, err := broker.NewProducer(partitioning.Hash{})
 	die(err)
@@ -80,7 +84,7 @@ func main() {
 	reg := metrics.NewRegistry()
 	cfg.Tracer.RegisterMetrics(reg)
 	p, err := processor.New(cfg, processor.Deps{
-		Consumer: consumer, Sink: store, Metrics: reg, Logger: log,
+		Consumer: consumer, Sink: store, Checkpoints: checkpoints, Metrics: reg, Logger: log,
 		DLQ: &reliability.BrokerDLQ{P: dlqProd, Topic: cfg.Topic + ".dlq"},
 	})
 	die(err)
