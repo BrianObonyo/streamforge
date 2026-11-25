@@ -15,7 +15,7 @@ Reproduce it with `scripts/e2e-local.sh` (see "How to reproduce").
 |---|---|---|
 | ClickHouse store | ✅ **verified on a real server** | ClickHouse **26.8.37 LTS** (official build) |
 | Redpanda adapter | 🟡 **verified on a real Kafka-protocol cluster; not on Redpanda itself** | franz-go **kfake** (real client, real wire protocol) |
-| Kafka TLS/SASL client configuration | 🟡 **client protocol tests pass; live TLS/SCRAM CI configured, pending run** | kfake: TLS/mTLS, PLAIN, SCRAM-SHA-256/512, invalid credentials; Redpanda CI: TLS + SCRAM-SHA-256 |
+| Kafka TLS/SASL client configuration | 🟡 **client protocol tests pass; live SCRAM CI configured, pending run** | kfake: TLS/mTLS, PLAIN, SCRAM-SHA-256/512, invalid credentials; Redpanda CI: SCRAM-SHA-256 |
 | Processor state checkpointing | 🟡 **in-memory recovery passes; live-service CI test added, pending run** | integration test with real Redpanda + ClickHouse in CI |
 | Full pipeline as separate processes | ✅ verified | real ClickHouse + Kafka-protocol broker + 2 processors + producer + API |
 | Crash recovery (`kill -9`) | ✅ verified, exact | real processes, real ClickHouse |
@@ -65,7 +65,7 @@ stored total is exact (2,140 unique events).
 
 **What this does not prove:** Redpanda-specific replication performance and production
 rebalance behavior. `kfake` is a simplified Kafka. CI job `redpanda-live` exercises the
-real broker with TLS and SASL/SCRAM authentication and runs the checkpoint recovery test
+real broker with SASL/SCRAM authentication and runs the checkpoint recovery test
 against real ClickHouse; this job has not been run from the current local environment.
 
 A defect found here: franz-go's default 45 s session timeout would leave a killed
@@ -80,10 +80,11 @@ TLS, SCRAM-SHA-256, SCRAM-SHA-512, rejection of invalid credentials, and invalid
 configuration handling against kfake. `PLAIN` without TLS fails during adapter
 initialization.
 
-The `redpanda-live` CI job configures an ephemeral TLS certificate and SCRAM-SHA-256
-credential on a real Redpanda listener, then verifies authenticated topic creation,
-produce, consume, and offset commit. mTLS, other SASL mechanisms, and production ACL
-policy remain protocol-tested with kfake or require deployment-specific verification.
+The `redpanda-live` CI job configures an ephemeral SCRAM-SHA-256 credential on a real
+Redpanda listener, then verifies authenticated topic creation, produce, consume, and
+offset commit. TLS/mTLS remain protocol-tested with kfake; real-broker TLS listener
+configuration, other SASL mechanisms, and production ACL policy require
+deployment-specific verification.
 
 ### Processor state checkpoints
 
@@ -97,7 +98,7 @@ parameterization, JSON encoding, and decoding are exercised with an HTTP test
 server.
 
 The `redpanda-live` CI job additionally runs `TestLiveCheckpointRecoveryAcrossServices`
-against real Redpanda (TLS + SCRAM) and ClickHouse: it saves state before a broker commit,
+against real Redpanda (SCRAM) and ClickHouse: it saves state before a broker commit,
 closes the first consumer, verifies the successor commits the restored checkpoint
 offset, and checks the exact aggregate total after processing more input.
 

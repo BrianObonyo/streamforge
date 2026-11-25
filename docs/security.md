@@ -51,7 +51,8 @@ through the deployment environment or a secret manager; do not commit a populate
 
 Build-tagged adapter tests exercise PLAIN-over-TLS and SCRAM authentication,
 invalid credentials, and configuration validation against franz-go's `kfake`.
-The `redpanda-live` CI job configures an ephemeral TLS certificate and
-SCRAM-SHA-256 credential on a real Redpanda listener and verifies authenticated
-client operations. mTLS, production ACL policy, and deployment-specific
-certificate provisioning still require verification against the target cluster.
+The `redpanda-live` CI job configures an ephemeral SCRAM-SHA-256 credential on a
+real Redpanda listener and verifies authenticated client operations. TLS/mTLS
+remain protocol-tested with kfake; real-broker TLS, production ACL policy, and
+deployment-specific certificate provisioning require verification against the
+target cluster.
